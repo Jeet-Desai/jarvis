@@ -49,6 +49,13 @@ pub fn start_watcher(app: AppHandle, app_state: Arc<AppState>) {
                     last_action = Instant::now();
                     continue;
                 }
+                // Don't wake-check during an active conversation session — the
+                // mic is being used by the regular Listening flow, no need for
+                // a wake word.
+                if app_state.session_active() {
+                    last_action = Instant::now();
+                    continue;
+                }
                 if last_action.elapsed() < Duration::from_millis(COOLDOWN_MS) {
                     continue;
                 }
@@ -72,11 +79,14 @@ pub fn start_watcher(app: AppHandle, app_state: Arc<AppState>) {
                 };
 
                 if contains_wake_phrase(&text) {
-                    tracing::info!("wake: detected → {:?}", text);
+                    tracing::info!("wake: detected → {:?} — starting conversation", text);
                     last_action = Instant::now();
                     // Clear so the wake phrase audio isn't re-fed into the
                     // recording buffer that begins on Listening transition.
                     pipe.clear_rolling();
+                    // Conversation mode ON — subsequent turns won't need
+                    // the wake word, just speak naturally.
+                    app_state.start_session();
                     app_state.set(&app, JarvisState::Listening);
                 }
             }

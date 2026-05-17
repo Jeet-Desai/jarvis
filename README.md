@@ -96,8 +96,34 @@ You can also say *"Jarvis"* alone — wake word is whisper-based, no extra depen
 - `get_browser_context` — URL + title + ~4 KB of visible page text (Chromium browsers + Safari)
 - `get_clipboard` — what the user just copied (works in any app, no permission)
 - `see_screen` — capture + Gemini vision describe (requires Screen Recording permission)
+- `list_calendar_events` — read events from Google Calendar (requires one-time setup below)
+- `create_calendar_event` — add events to Google Calendar (same setup)
 
-Add your own in `src-tauri/src/tools.rs`.
+Add your own in `src-tauri/src/tools.rs`. Plug in any [MCP server](https://modelcontextprotocol.io/) (Slack, GitHub, Notion, Postgres, ...) by adding a few lines in `src-tauri/src/mcp.rs`.
+
+---
+
+## Calendar setup (optional, one-time)
+
+Jarvis talks to Google Calendar through the [`@cocal/google-calendar-mcp`](https://github.com/nspady/google-calendar-mcp) MCP server, spawned on demand via `npx`. You need to grant OAuth access to your own calendar once.
+
+1. **Create a Google Cloud project** at https://console.cloud.google.com/ (use your **personal** Google account, not work).
+2. **APIs & Services → Library** → enable **Google Calendar API**.
+3. **APIs & Services → OAuth consent screen** → External → fill in app name "Jarvis" → add yourself as a Test User under "Test users" (keeps the app in Testing mode, no Google verification needed).
+4. **APIs & Services → Credentials → Create Credentials → OAuth client ID** → **Desktop app** → download the JSON.
+5. Save it somewhere private:
+   ```bash
+   mkdir -p ~/.config/jarvis
+   mv ~/Downloads/client_secret_*.json ~/.config/jarvis/gcp-oauth.keys.json
+   chmod 600 ~/.config/jarvis/gcp-oauth.keys.json
+   ```
+6. Add to `.env`:
+   ```
+   GOOGLE_OAUTH_CREDENTIALS=/Users/you/.config/jarvis/gcp-oauth.keys.json
+   ```
+7. Restart Jarvis (`pnpm tauri dev`). On first calendar query, a browser tab opens for consent. Token is then cached on disk; subsequent queries are silent.
+
+If the file isn't there, calendar tools simply respond with a setup hint — Jarvis still works for everything else.
 
 ---
 

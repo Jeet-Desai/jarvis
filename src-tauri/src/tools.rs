@@ -75,7 +75,44 @@ pub fn registry() -> Vec<Tool> {
             }),
             handler: see_screen,
         },
-        // Future: send_message, get_calendar_events, set_clipboard,
+        Tool {
+            name: "list_calendar_events",
+            declaration: json!({
+                "name": "list_calendar_events",
+                "description": "Read events from the user's Google Calendar (via MCP server). Use for 'what's on my calendar', 'what meetings do I have today/tomorrow/this week', 'when's my next meeting'. Pass timeMin and timeMax as ISO-8601 timestamps that bracket the window the user is asking about. Returns event summaries with start/end times. Requires the user to have configured GOOGLE_OAUTH_CREDENTIALS in .env (see README).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "timeMin": { "type": "string", "description": "ISO-8601 start of the time window, e.g. '2026-05-17T00:00:00+05:30' for the start of today in the user's local time." },
+                        "timeMax": { "type": "string", "description": "ISO-8601 end of the time window, e.g. '2026-05-17T23:59:59+05:30' for end of today." },
+                        "calendarId": { "type": "string", "description": "Optional. Defaults to 'primary' (the user's main calendar)." }
+                    },
+                    "required": ["timeMin", "timeMax"]
+                }
+            }),
+            handler: list_calendar_events,
+        },
+        Tool {
+            name: "create_calendar_event",
+            declaration: json!({
+                "name": "create_calendar_event",
+                "description": "Create a new event on the user's Google Calendar. Use when the user says 'schedule X for tomorrow at 3pm', 'add a meeting with Y on Friday', etc. ALWAYS confirm the title, date, and time with the user BEFORE calling unless they were unambiguously specific.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "summary":     { "type": "string", "description": "Event title." },
+                        "start":       { "type": "string", "description": "ISO-8601 start time, e.g. '2026-05-18T15:00:00+05:30'." },
+                        "end":         { "type": "string", "description": "ISO-8601 end time. Required by Google Calendar API." },
+                        "description": { "type": "string", "description": "Optional details / notes." },
+                        "location":    { "type": "string", "description": "Optional location string." },
+                        "calendarId":  { "type": "string", "description": "Optional. Defaults to 'primary'." }
+                    },
+                    "required": ["summary", "start", "end"]
+                }
+            }),
+            handler: create_calendar_event,
+        },
+        // Future: send_message, set_clipboard,
         //         read_screen_via_accessibility, click_at_xy, …
     ]
 }
@@ -214,6 +251,34 @@ fn see_screen(args: &Value) -> Result<Value> {
 // Clipboard tool — the no-permission fallback for "what's on screen" queries.
 // Works on every Mac without admin / Screen Recording / Accessibility.
 // ──────────────────────────────────────────────────────────────────────────────
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Calendar tools — dispatched to the Google Calendar MCP server via the
+// global mcp::McpManager. Returns a friendly setup hint when not configured.
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn list_calendar_events(args: &Value) -> Result<Value> {
+    let mcp = crate::mcp::global()
+        .ok_or_else(|| anyhow::anyhow!("MCP manager not running"))?;
+    // The cocal/google-calendar-mcp tool is named "list-events"
+    mcp.calendar_call("list-events", normalize_calendar_args(args))
+}
+
+fn create_calendar_event(args: &Value) -> Result<Value> {
+    let mcp = crate::mcp::global()
+        .ok_or_else(|| anyhow::anyhow!("MCP manager not running"))?;
+    // The cocal/google-calendar-mcp tool is named "create-event"
+    mcp.calendar_call("create-event", normalize_calendar_args(args))
+}
+
+/// Inject a default calendarId of "primary" if the LLM omitted it.
+fn normalize_calendar_args(args: &Value) -> Value {
+    let mut obj = args.as_object().cloned().unwrap_or_default();
+    if !obj.contains_key("calendarId") {
+        obj.insert("calendarId".into(), Value::String("primary".into()));
+    }
+    Value::Object(obj)
+}
 
 fn get_clipboard(_args: &Value) -> Result<Value> {
     let output = std::process::Command::new("pbpaste").output()?;

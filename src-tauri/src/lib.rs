@@ -1,10 +1,11 @@
-// Reload trigger: 2026-05-17h (clipboard fallback tool)
+// Reload trigger: 2026-05-17m (non-technical error messages — logs-only details)
 #[cfg(target_os = "macos")]
 #[macro_use]
 extern crate objc;
 
 mod audio;
 mod brain;
+mod mcp;
 mod state;
 mod stt;
 mod tools;
@@ -76,8 +77,10 @@ fn jarvis_stop(app: AppHandle, st: tauri::State<'_, Arc<AppState>>) {
 // HUD <-> orb mutual exclusivity
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Cmd+Shift+C — hide every Jarvis surface (orb + HUD). Press again to
-/// bring Jarvis back (just the orb returns; HUD has to be re-opened explicitly).
+/// Cmd+Shift+C — hide every Jarvis surface (orb + HUD). Also ends any
+/// active conversation session so Jarvis isn't still listening in the
+/// background while hidden. Press again to bring Jarvis back (just the orb
+/// returns; HUD has to be re-opened explicitly).
 fn toggle_close_internal(app: &AppHandle) {
     let orb = app.get_webview_window("orb");
     let hud = app.get_webview_window("hud");
@@ -85,6 +88,11 @@ fn toggle_close_internal(app: &AppHandle) {
     let orb_visible = orb.as_ref().and_then(|w| w.is_visible().ok()).unwrap_or(false);
     let hud_visible = hud.as_ref().and_then(|w| w.is_visible().ok()).unwrap_or(false);
     let anything_visible = orb_visible || hud_visible;
+
+    // Always end the conversation session on a close action — user is
+    // explicitly stepping away.
+    let st: tauri::State<'_, Arc<AppState>> = app.state();
+    st.stop(app);
 
     if anything_visible {
         if let Some(o) = &orb { let _ = o.hide(); }
@@ -124,28 +132,28 @@ fn toggle_hud_internal(app: &AppHandle) {
 // Orb window setup (positioning + macOS overlay behavior)
 // ──────────────────────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy)]
+enum OrbPreset {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+const ORB_MARGIN: f64 = 24.0;
+
 fn position_orb(app: &AppHandle) -> tauri::Result<()> {
     let orb = app
         .get_webview_window("orb")
         .ok_or_else(|| tauri::Error::WindowNotFound)?;
 
-    if let Some(monitor) = orb.current_monitor()? {
-        let scale = monitor.scale_factor();
-        let mon_w_logical = monitor.size().width as f64 / scale;
-        // Window is 360x360 but the visible disc is centered ~280px wide,
-        // so we offset by ~360px to keep the disc the same visual distance
-        // from the screen edge as before.
-        let x_logical = mon_w_logical - 360.0 + 8.0;
-        let y_logical = 30.0;
-        orb.set_position(tauri::LogicalPosition::new(x_logical, y_logical))?;
-        tracing::info!(
-            "orb at logical ({:.0}, {:.0}); monitor {}x{} scale {:.1}",
-            x_logical,
-            y_logical,
-            monitor.size().width,
-            monitor.size().height,
-            scale
-        );
+    // Try restoring the user's last-known orb position; otherwise default to
+    // the top-right corner.
+    if let Some((lx, ly)) = load_orb_position(app) {
+        orb.set_position(tauri::LogicalPosition::new(lx, ly))?;
+        tracing::info!("orb restored to saved position ({:.0}, {:.0})", lx, ly);
+    } else {
+        move_orb_to_preset(&orb, OrbPreset::TopRight)?;
     }
 
     orb.show()?;
@@ -158,6 +166,48 @@ fn position_orb(app: &AppHandle) -> tauri::Result<()> {
     }
 
     Ok(())
+}
+
+fn move_orb_to_preset(orb: &tauri::WebviewWindow, preset: OrbPreset) -> tauri::Result<()> {
+    let Some(monitor) = orb.current_monitor()? else { return Ok(()); };
+    let scale = monitor.scale_factor();
+    let mon_w = monitor.size().width as f64 / scale;
+    let mon_h = monitor.size().height as f64 / scale;
+    let win = orb.outer_size()?;
+    let win_w = win.width as f64 / scale;
+    let win_h = win.height as f64 / scale;
+
+    let (x, y) = match preset {
+        OrbPreset::TopLeft     => (ORB_MARGIN,                ORB_MARGIN),
+        OrbPreset::TopRight    => (mon_w - win_w - ORB_MARGIN, ORB_MARGIN),
+        OrbPreset::BottomLeft  => (ORB_MARGIN,                mon_h - win_h - ORB_MARGIN),
+        OrbPreset::BottomRight => (mon_w - win_w - ORB_MARGIN, mon_h - win_h - ORB_MARGIN),
+    };
+    orb.set_position(tauri::LogicalPosition::new(x, y))?;
+    tracing::info!("orb → {:?} at ({:.0}, {:.0})", preset, x, y);
+    Ok(())
+}
+
+fn orb_position_file(app: &AppHandle) -> Option<std::path::PathBuf> {
+    app.path().app_data_dir().ok().map(|d| d.join("orb_position.json"))
+}
+
+fn save_orb_position(app: &AppHandle, lx: f64, ly: f64) {
+    let Some(path) = orb_position_file(app) else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let json = serde_json::json!({ "x": lx, "y": ly });
+    if let Err(e) = std::fs::write(&path, json.to_string()) {
+        tracing::warn!("save orb pos: {e}");
+    }
+}
+
+fn load_orb_position(app: &AppHandle) -> Option<(f64, f64)> {
+    let path = orb_position_file(app)?;
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    Some((v.get("x")?.as_f64()?, v.get("y")?.as_f64()?))
 }
 
 /// Convert orb + HUD windows into NSPanels and set them as ScreenSaver-level
@@ -243,6 +293,11 @@ pub fn run() {
     let stop_sc      = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyS);
     let brighter_sc  = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Equal);
     let dimmer_sc    = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Minus);
+    // Orb position presets (⇧⌘1-4 = TL TR BR BL — clockwise from top-left)
+    let pos_tl_sc    = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Digit1);
+    let pos_tr_sc    = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Digit2);
+    let pos_br_sc    = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Digit3);
+    let pos_bl_sc    = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Digit4);
     // DEV: preview every state
     let preview_sc   = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyP);
 
@@ -258,6 +313,10 @@ pub fn run() {
     let stop_sc_for_handler     = stop_sc.clone();
     let brighter_sc_for_handler = brighter_sc.clone();
     let dimmer_sc_for_handler   = dimmer_sc.clone();
+    let pos_tl_sc_for_handler   = pos_tl_sc.clone();
+    let pos_tr_sc_for_handler   = pos_tr_sc.clone();
+    let pos_br_sc_for_handler   = pos_br_sc.clone();
+    let pos_bl_sc_for_handler   = pos_bl_sc.clone();
     let preview_sc_for_handler  = preview_sc.clone();
 
     let builder = tauri::Builder::default()
@@ -291,6 +350,22 @@ pub fn run() {
                         app_state_for_bright.adjust_brightness(app, 0.15);
                     } else if shortcut == &dimmer_sc_for_handler {
                         app_state_for_bright.adjust_brightness(app, -0.15);
+                    } else if shortcut == &pos_tl_sc_for_handler {
+                        if let Some(orb) = app.get_webview_window("orb") {
+                            let _ = move_orb_to_preset(&orb, OrbPreset::TopLeft);
+                        }
+                    } else if shortcut == &pos_tr_sc_for_handler {
+                        if let Some(orb) = app.get_webview_window("orb") {
+                            let _ = move_orb_to_preset(&orb, OrbPreset::TopRight);
+                        }
+                    } else if shortcut == &pos_br_sc_for_handler {
+                        if let Some(orb) = app.get_webview_window("orb") {
+                            let _ = move_orb_to_preset(&orb, OrbPreset::BottomRight);
+                        }
+                    } else if shortcut == &pos_bl_sc_for_handler {
+                        if let Some(orb) = app.get_webview_window("orb") {
+                            let _ = move_orb_to_preset(&orb, OrbPreset::BottomLeft);
+                        }
                     } else if shortcut == &preview_sc_for_handler {
                         tracing::info!("hotkey: Cmd+Shift+P — preview cycle (dev)");
                         app_state_for_preview.dev_cycle(app);
@@ -346,6 +421,23 @@ pub fn run() {
                 }
             }
 
+            // Optional: start MCP servers. Only initialize Google Calendar if
+            // the user supplied an OAuth credentials path. Failure is non-fatal
+            // — the calendar tools just report a friendly setup error when used.
+            match mcp::McpManager::new() {
+                Ok(manager) => {
+                    manager.install_global();
+                    if let Ok(creds) = std::env::var("GOOGLE_OAUTH_CREDENTIALS") {
+                        if !creds.trim().is_empty() {
+                            if let Err(e) = manager.init_calendar(creds.trim()) {
+                                tracing::warn!("mcp[calendar]: {e}");
+                            }
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("mcp: failed to start manager: {e}"),
+            }
+
             let gs = app.global_shortcut();
             gs.register(jarvis_sc)?;
             gs.register(hud_sc)?;
@@ -354,7 +446,28 @@ pub fn run() {
             gs.register(stop_sc)?;
             gs.register(brighter_sc)?;
             gs.register(dimmer_sc)?;
+            gs.register(pos_tl_sc)?;
+            gs.register(pos_tr_sc)?;
+            gs.register(pos_br_sc)?;
+            gs.register(pos_bl_sc)?;
             gs.register(preview_sc)?;
+
+            // Persist orb position whenever the user drags or hotkey-moves it.
+            if let Some(orb) = app.get_webview_window("orb") {
+                let app_handle = app.handle().clone();
+                let orb_clone = orb.clone();
+                orb.on_window_event(move |evt| {
+                    if let tauri::WindowEvent::Moved(_) = evt {
+                        // Capture as logical coords (DPI-independent)
+                        if let Ok(pos) = orb_clone.outer_position() {
+                            let scale = orb_clone.scale_factor().unwrap_or(2.0);
+                            let lx = pos.x as f64 / scale;
+                            let ly = pos.y as f64 / scale;
+                            save_orb_position(&app_handle, lx, ly);
+                        }
+                    }
+                });
+            }
 
             // VAD listener: auto-end the utterance after silence
             let vad_app    = app.handle().clone();
@@ -375,7 +488,15 @@ pub fn run() {
             stt::prewarm();
 
             tracing::info!(
-                "Jarvis ready. ⇧⌘J on/off · ⇧⌘S stop · ⇧⌘H HUD · ⇧⌘C close · ⇧⌘R reset · ⇧⌘+/- brightness · ⇧⌘P preview (dev)"
+                "Jarvis ready.  Hotkeys: \
+                 Cmd+Shift+J on/off | \
+                 Cmd+Shift+S stop | \
+                 Cmd+Shift+H HUD | \
+                 Cmd+Shift+C close | \
+                 Cmd+Shift+R reset | \
+                 Cmd+Shift+(+/-) brightness | \
+                 Cmd+Shift+(1..4) corner | \
+                 Cmd+Shift+P preview (dev)"
             );
             Ok(())
         })

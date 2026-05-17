@@ -31,6 +31,10 @@ whisper-rs = { version = "0.14", features = ["metal"] }
 rubato = "0.16"
 libc = "0.2"
 base64 = "0.22"
+# MCP client — talks to external tool servers (e.g. @cocal/google-calendar-mcp)
+# over stdio. Optional at runtime — only spawns if user configures credentials.
+# (tokio already declared above with "full" features — covers what rmcp needs.)
+rmcp = { version = "0.8", features = ["client", "transport-child-process"] }
 
 [target."cfg(target_os = \"macos\")".dependencies]
 cocoa = "0.26"

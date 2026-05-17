@@ -26,11 +26,24 @@ use tauri::{AppHandle, Emitter};
 /// for short phrases like "Hey Jarvis".
 const ROLLING_WINDOW_SECS: f32 = 2.0;
 
-// VAD tuning — see previous comments
-const VOICE_RMS_THRESHOLD:   f32 = 0.020;
-const SILENCE_RMS_THRESHOLD: f32 = 0.012;
-const MIN_SPEECH_MS:         u64 = 350;
-const SILENCE_TO_STOP_MS:    u64 = 1400;
+// VAD tuning.
+//
+// Algorithm: exponential-moving-average smoothing of RMS, then a tiny state
+// machine: Silent → Speaking (when smoothed RMS crosses voice threshold for
+// at least MIN_SPEECH_MS cumulative) → Ended (when smoothed RMS stays under
+// the threshold for SILENCE_TO_STOP_MS continuous). Plus a hard
+// MAX_UTTERANCE_MS ceiling so a stuck mic never leaves the user waiting.
+//
+// Removed the old two-threshold deadband — it could freeze the silence
+// timer if room ambient sat between the two thresholds.
+//
+// Industry refs: ChatGPT Voice ~500-700ms silence-to-stop, Gemini Live 700ms
+// default. We use 700ms with EMA smoothing for stability.
+const VOICE_RMS_THRESHOLD: f32 = 0.018;   // smoothed RMS above this = speech
+const EMA_ALPHA:           f32 = 0.3;     // higher = react faster to changes
+const MIN_SPEECH_MS:       u64 = 250;     // total speech needed before VAD may fire
+const SILENCE_TO_STOP_MS:  u64 = 700;     // continuous silence after speech → end
+const MAX_UTTERANCE_MS:    u64 = 30_000;  // hard ceiling — force-end if recording runs this long
 
 // Barge-in tuning. We do "AEC lite": for the first GRACE_MS of speech,
 // triggering is suppressed AND we sample the ambient RMS (which is
@@ -146,35 +159,70 @@ impl BargeInDetector {
     }
 }
 
+/// Voice-activity detector with EMA smoothing + a 3-state machine.
+/// One threshold (no deadband). Tracks cumulative speech ms and continuous
+/// silence ms separately so a brief mid-utterance breath doesn't reset speech,
+/// and ambient noise can't freeze silence detection.
 #[derive(Default)]
 struct VadTracker {
-    first_speech: Option<std::time::Instant>,
-    last_speech:  Option<std::time::Instant>,
-    triggered:    bool,
+    smoothed_rms:  f32,
+    started_at:    Option<std::time::Instant>,
+    speech_ms:     u64,                    // cumulative voiced duration this utterance
+    last_voice_at: Option<std::time::Instant>,
+    last_sample_at: Option<std::time::Instant>,
+    triggered:     bool,
 }
 
 impl VadTracker {
     fn reset(&mut self) {
-        self.first_speech = None;
-        self.last_speech  = None;
-        self.triggered    = false;
+        self.smoothed_rms   = 0.0;
+        self.started_at     = None;
+        self.speech_ms      = 0;
+        self.last_voice_at  = None;
+        self.last_sample_at = None;
+        self.triggered      = false;
     }
 
     fn process(&mut self, rms: f32) -> bool {
         if self.triggered { return false; }
         let now = std::time::Instant::now();
-        if rms > VOICE_RMS_THRESHOLD {
-            if self.first_speech.is_none() {
-                self.first_speech = Some(now);
-            }
-            self.last_speech = Some(now);
+
+        // First-sample bootstrap
+        if self.started_at.is_none() {
+            self.started_at     = Some(now);
+            self.last_sample_at = Some(now);
+            self.smoothed_rms   = rms;
             return false;
         }
-        if rms < SILENCE_RMS_THRESHOLD {
-            if let (Some(first), Some(last)) = (self.first_speech, self.last_speech) {
-                let speech_ms  = last.duration_since(first).as_millis() as u64;
-                let silence_ms = now.duration_since(last).as_millis() as u64;
-                if speech_ms >= MIN_SPEECH_MS && silence_ms >= SILENCE_TO_STOP_MS {
+
+        // EMA smoothing — flattens noise spikes that would otherwise reset speech
+        self.smoothed_rms = self.smoothed_rms * (1.0 - EMA_ALPHA) + rms * EMA_ALPHA;
+
+        let dt_ms = self.last_sample_at
+            .map(|t| now.duration_since(t).as_millis() as u64)
+            .unwrap_or(0);
+        self.last_sample_at = Some(now);
+
+        let is_voice = self.smoothed_rms > VOICE_RMS_THRESHOLD;
+        if is_voice {
+            self.speech_ms = self.speech_ms.saturating_add(dt_ms);
+            self.last_voice_at = Some(now);
+        }
+
+        // Hard timeout — force-end no matter what so user never gets stuck
+        if let Some(start) = self.started_at {
+            if now.duration_since(start).as_millis() as u64 >= MAX_UTTERANCE_MS {
+                tracing::warn!("vad: hit MAX_UTTERANCE_MS, forcing end");
+                self.triggered = true;
+                return true;
+            }
+        }
+
+        // End-of-utterance: enough cumulative speech, then enough continuous silence
+        if self.speech_ms >= MIN_SPEECH_MS {
+            if let Some(last_v) = self.last_voice_at {
+                let silence_ms = now.duration_since(last_v).as_millis() as u64;
+                if !is_voice && silence_ms >= SILENCE_TO_STOP_MS {
                     self.triggered = true;
                     return true;
                 }

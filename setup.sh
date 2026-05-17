@@ -102,7 +102,7 @@ echo "────────────────────────�
 echo ""
 echo " Next:"
 echo "   1. Fill in at least one LLM provider key in .env"
-echo "   2. Run:  pnpm tauri dev"
+echo "   2. Run:  NO_COLOR=1 pnpm tauri dev   # NO_COLOR keeps build output clean"
 echo "   3. Grant the microphone permission when macOS prompts"
 echo "   4. Say \"Jarvis, what time is it?\""
 echo ""

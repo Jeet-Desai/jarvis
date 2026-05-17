@@ -1,6 +1,7 @@
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -31,6 +32,11 @@ pub struct AppState {
     brightness: Mutex<f32>,
     /// Currently-playing TTS subprocess handle, so barge-in can kill it.
     speech:     Mutex<Option<Arc<SpeechHandle>>>,
+    /// Conversation mode: when true, after each turn Jarvis automatically
+    /// re-arms the mic for the next user utterance — no need to re-say
+    /// "Jarvis". Set by wake word or first Cmd+Shift+J; cleared by Cmd+Shift+S
+    /// or Cmd+Shift+C, or by toggling off mid-Listening.
+    session:    AtomicBool,
 }
 
 impl AppState {
@@ -42,7 +48,26 @@ impl AppState {
             brain:        OnceLock::new(),
             brightness:   Mutex::new(1.0),
             speech:       Mutex::new(None),
+            session:      AtomicBool::new(false),
         })
+    }
+
+    pub fn session_active(&self) -> bool {
+        self.session.load(Ordering::Acquire)
+    }
+
+    pub fn start_session(&self) {
+        if !self.session_active() {
+            self.session.store(true, Ordering::Release);
+            tracing::info!("session: conversation mode ON");
+        }
+    }
+
+    pub fn end_session(&self) {
+        if self.session_active() {
+            self.session.store(false, Ordering::Release);
+            tracing::info!("session: conversation mode OFF");
+        }
     }
 
     pub fn init_pipe(&self, pipe: Arc<AudioPipe>) {
@@ -188,11 +213,18 @@ impl AppState {
 
             *st.speech.lock() = None;
 
-            // Only transition to Idle if barge-in didn't already move us
-            // elsewhere (e.g. to Listening). Comparing the CURRENT state
-            // is reliable now that every transition goes through set().
+            // After TTS finishes naturally:
+            //   - If we're in conversation mode → re-arm the mic immediately
+            //     (Speaking → Listening) so the user can speak the next turn
+            //     without needing to re-trigger the wake word.
+            //   - Otherwise → back to Idle.
+            // Skip if barge-in already moved us elsewhere.
             if st.current() == JarvisState::Speaking {
-                st.set(&app, JarvisState::Idle);
+                if st.session_active() {
+                    st.set(&app, JarvisState::Listening);
+                } else {
+                    st.set(&app, JarvisState::Idle);
+                }
             }
         });
     }
@@ -210,15 +242,24 @@ impl AppState {
     pub fn toggle(&self, app: &AppHandle) {
         let current = *self.state.read();
         let next = match current {
-            JarvisState::Idle      => JarvisState::Listening,
-            JarvisState::Speaking  => {
+            JarvisState::Idle => {
+                // Manual start of a conversation session
+                self.start_session();
+                JarvisState::Listening
+            }
+            JarvisState::Speaking => {
                 // Manual interrupt while Jarvis is talking: kill the TTS
-                // subprocess and jump straight into Listening so the user's
-                // next utterance is captured.
+                // and jump back to Listening. Session stays active so the
+                // user can immediately speak.
                 self.kill_current_speech();
                 JarvisState::Listening
             }
-            _ => JarvisState::Idle,
+            _ => {
+                // Listening / Thinking / Error → cancel current activity and
+                // end the conversation session.
+                self.end_session();
+                JarvisState::Idle
+            }
         };
         self.set(app, next);
     }
@@ -232,11 +273,13 @@ impl AppState {
         }
     }
 
-    /// Hard stop from any state. Kills TTS, returns to Idle. In-flight LLM
-    /// calls may still complete on their thread but their result is dropped.
+    /// Hard stop from any state. Kills TTS, ends the conversation session,
+    /// returns to Idle. In-flight LLM calls may still complete on their
+    /// thread but their result is dropped on the floor.
     pub fn stop(&self, app: &AppHandle) {
         let current = self.current();
         tracing::info!("stop: requested from {:?}", current);
+        self.end_session();
         self.kill_current_speech();
         if let Some(pipe) = self.pipe.get() {
             pipe.stop_speaking_mode();
@@ -287,65 +330,27 @@ fn save_recording_to_tmp(result: &audio::RecordingResult) -> anyhow::Result<Path
     Ok(path)
 }
 
-/// Turn an upstream error into a short, speakable sentence.
-/// Strips URLs / JSON / parens so the TTS doesn't read out garbage.
-fn friendly_brain_error(e: &str) -> String {
-    let lc = e.to_lowercase();
-    if lc.contains("429") || lc.contains("resource_exhausted") || lc.contains("rate limit") || lc.contains("quota") {
-        "Every brain provider is rate-limited at the moment, sir. Try again in a minute.".to_string()
-    } else if lc.contains("no llm provider configured") || lc.contains("api_key") || lc.contains("api key") || lc.contains("gemini_api_key") || lc.contains("openai_api_key") {
-        "No brain is configured, sir. Check the env file.".to_string()
-    } else if lc.contains("error sending request") || lc.contains("dns") || lc.contains("tls") || lc.contains("ssl") || lc.contains("connection refused") || lc.contains("connection reset") {
-        // Often a network filter blocking an
-        // uncategorized LLM endpoint. Be specific so the user knows what to fix.
-        "I couldn't reach the brain provider, sir. The endpoint may be blocked by your network.".to_string()
-    } else if lc.contains("timeout") || lc.contains("timed out") {
-        "The request timed out, sir.".to_string()
-    } else if lc.contains("connect") || lc.contains("network") || lc.contains("unreachable") {
-        "Network issue, sir. I couldn't reach the brain.".to_string()
-    } else if lc.contains("503") || lc.contains("502") || lc.contains("504") {
-        "The brain provider is having trouble, sir. Try again shortly.".to_string()
-    } else {
-        // Generic — pull just the first line and strip URLs / brackets / JSON noise
-        let first = e.lines().next().unwrap_or(e);
-        let cleaned = clean_for_speech(first);
-        if cleaned.is_empty() {
-            "Something went wrong, sir.".to_string()
-        } else {
-            format!("Something went wrong, sir. {}", cleaned)
-        }
-    }
-}
-
-/// Strip URLs, parenthesized blocks, JSON braces — anything that sounds bad
-/// when read aloud.
-fn clean_for_speech(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut paren_depth: i32 = 0;
-    let mut brace_depth: i32 = 0;
-    for word in s.split_whitespace() {
-        // Skip URLs entirely
-        if word.contains("http://") || word.contains("https://") {
-            continue;
-        }
-        let mut buf = String::with_capacity(word.len());
-        for c in word.chars() {
-            match c {
-                '(' => paren_depth += 1,
-                ')' => paren_depth = (paren_depth - 1).max(0),
-                '{' => brace_depth += 1,
-                '}' => brace_depth = (brace_depth - 1).max(0),
-                _ if paren_depth == 0 && brace_depth == 0 => buf.push(c),
-                _ => {} // inside ( ) or { } — skip
-            }
-        }
-        let trimmed = buf.trim_matches(|c: char| !c.is_alphanumeric() && c != '.');
-        if trimmed.is_empty() { continue; }
-        if !out.is_empty() { out.push(' '); }
-        out.push_str(trimmed);
-        if out.len() > 120 { break; } // cap length so we don't ramble
-    }
-    out
+/// Map any upstream error to a SHORT, NON-TECHNICAL spoken acknowledgement.
+/// The real error (provider name, URL, HTTP code, JSON body) goes only to
+/// the tracing log — it never reaches the user. Three principles:
+///   1. Don't leak implementation details ("brain provider", "API", URLs).
+///   2. Don't suggest configuration steps to non-dev users.
+///   3. Don't be verbose — one short sentence so the user just knows
+///      something didn't go through and they can retry.
+fn friendly_brain_error(_e: &str) -> String {
+    // Rotate through a few phrasings so back-to-back errors don't sound
+    // like a broken record. (Cheap deterministic rotation by clock seconds.)
+    let phrasings = [
+        "Apologies, sir — I couldn't get to that one. Please try again.",
+        "I'm having a moment of trouble, sir. Could you repeat that?",
+        "Something went sideways, sir. Try once more.",
+    ];
+    let i = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as usize)
+        .unwrap_or(0)
+        % phrasings.len();
+    phrasings[i].to_string()
 }
 
 // Silence dead-code warning for brain re-export

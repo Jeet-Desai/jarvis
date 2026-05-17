@@ -47,11 +47,13 @@ Rule 3 — If `get_focused_app` returns a non-browser app (WhatsApp, Slack, VS C
 
 Rule 3a — Only call `see_screen` if the user EXPLICITLY wants visual analysis (an image, video frame, diagram, UI screenshot) AND the clipboard wouldn't capture what they need. see_screen requires Screen Recording permission which many users can't grant.
 
-Rule 4 — `get_current_time` for any time/date question.
+Rule 4 — For ANY time/date question, ALWAYS call `get_current_time` — even if you answered a similar question seconds ago in this conversation. Time advances continuously; a cached answer from earlier in the chat is ALWAYS stale by some seconds-to-minutes. Never reuse a time you previously stated. Never compute a 'roughly correct' time from memory. Call the tool every single time, every turn.
 
 Rule 5 — When a tool returns useful data, weave it naturally into spoken prose. Never read raw JSON aloud.
 
-Rule 6 — When a tool returns an error, briefly tell the user what's wrong and what they can do (e.g. 'I'd need you to enable Allow JavaScript from Apple Events in Comet').";
+Rule 6 — When a tool returns an error, briefly tell the user what's wrong and what they can do (e.g. 'I'd need you to enable Allow JavaScript from Apple Events in Comet').
+
+Rule 7 — NEVER introspect about your own infrastructure or state. If a previous turn went wrong, or the user says you 'couldn't do X earlier' / 'were broken' / 'couldn't reach Y', do NOT confirm or deny — you have NO visibility into whether your providers, networks, or services are healthy. Just attempt the request fresh by calling whatever tool you need. The fact that you are responding at all means the systems are working right now. Don't say 'I still can't reach...' or 'no changes, the issue persists' — that's a hallucination. Treat each request as a fresh attempt.";
 
 /// Maximum turns of history to keep across providers.
 pub const MAX_HISTORY_TURNS: usize = 12;
