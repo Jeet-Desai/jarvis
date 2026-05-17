@@ -190,6 +190,3 @@ Confirm you're on the latest build — the bloom was tuned to fit inside the orb
 
 All rights reserved. Source visible for reference and personal use only. Do not redistribute, sublicense, or use in derivative work without explicit permission.
 
----
-
-*Built incrementally with Claude Code.*
