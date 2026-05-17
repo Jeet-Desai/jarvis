@@ -1,0 +1,38 @@
+/*
+ * The orb window is a fully transparent rectangle. The Three.js sphere renders
+ * only inside its projected silhouette — outside the sphere, pixels stay
+ * transparent (clear color alpha = 0). No CSS clipping, no drop-shadows, no
+ * extra elements: the shape you see is literally the rendered sphere, and
+ * the chunky speaking animation can extend freely past the sphere's rest
+ * radius without being clipped by any rectangle.
+ */
+.orb-root {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  background: transparent;
+  display: block;
+  -webkit-app-region: drag;
+  cursor: grab;
+}
+
+.orb-root:active {
+  cursor: grabbing;
+}
+
+.orb-label {
+  position: absolute;
+  bottom: 14px;
+  left: 0;
+  right: 0;
+  text-align: center;
+  font-size: 9px;
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  color: var(--jarvis-cyan);
+  opacity: 0.45;
+  pointer-events: none;
+  text-shadow: 0 0 8px rgba(65, 227, 255, 0.7);
+  font-weight: 500;
+  z-index: 10;
+}

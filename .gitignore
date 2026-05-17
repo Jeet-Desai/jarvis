@@ -1,0 +1,32 @@
+node_modules
+dist
+
+# Secrets — never commit
+.env
+.env.local
+.env.*.local
+
+# Tauri build artifacts
+src-tauri/target
+src-tauri/gen
+
+# Downloaded AI models (large binaries)
+models/
+*.gguf
+*.onnx
+*.bin.weights
+
+# Recordings + screenshots Jarvis writes during runs
+/tmp/jarvis_*.wav
+/tmp/jarvis_screen_*.jpg
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.idea/
+*.swp
+*.swo
+

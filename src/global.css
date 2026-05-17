@@ -1,0 +1,27 @@
+:root {
+  --jarvis-cyan: #41e3ff;
+  --jarvis-cyan-dim: #1c8aa8;
+  --jarvis-amber: #ffb347;
+  --jarvis-red: #ff5050;
+  --jarvis-bg: rgba(4, 12, 20, 0.55);
+  --jarvis-glass: rgba(20, 35, 50, 0.35);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+button {
+  background: transparent;
+  border: 1px solid var(--jarvis-cyan-dim);
+  color: var(--jarvis-cyan);
+  font-family: inherit;
+  padding: 6px 12px;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+button:hover {
+  border-color: var(--jarvis-cyan);
+  box-shadow: 0 0 12px rgba(65, 227, 255, 0.4);
+}
