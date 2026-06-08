@@ -12,8 +12,11 @@
 //! a default-port Ollama daemon answers a quick health ping at startup.
 
 use anyhow::{anyhow, bail, Result};
+use regex::Regex;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use crate::tools;
 use super::{LlmProvider, Message, Role, MAX_TOOL_ROUNDS, REQUEST_TIMEOUT_SECS, SYSTEM_PROMPT};
@@ -49,11 +52,11 @@ impl Provider {
     }
 
     pub fn base_url(&self) -> &str { &self.base_url }
-    pub fn model(&self)    -> &str { &self.model }
 }
 
 impl LlmProvider for Provider {
     fn name(&self) -> &'static str { "ollama" }
+    fn model(&self) -> &str { &self.model }
 
     fn generate(&self, history: &[Message], tools_reg: &[tools::Tool]) -> Result<String> {
         // OpenAI-compatible messages format
@@ -80,6 +83,11 @@ impl LlmProvider for Provider {
 
         let url = format!("{}/v1/chat/completions", self.base_url);
 
+        // Track which tools the model called this turn, so the hallucination
+        // guard can verify any factual claims (times, calendar events,
+        // weather) were actually grounded in a tool response.
+        let mut tools_called: HashSet<String> = HashSet::new();
+
         for round in 0..MAX_TOOL_ROUNDS {
             let body = json!({
                 "model":       self.model,
@@ -89,7 +97,12 @@ impl LlmProvider for Provider {
                 "stream":      false,
                 "options": {
                     "temperature": 0.7,
-                    "num_predict": 512,
+                    // Reasoning models (gpt-oss, deepseek-r1, qwen3) spend
+                    // hidden thinking tokens against this budget BEFORE
+                    // emitting the visible answer; 512 could be consumed
+                    // entirely by reasoning on a tool-use turn, leaving empty
+                    // content (and a spurious fallback to the next provider).
+                    "num_predict": 2048,
                 }
             });
 
@@ -110,7 +123,19 @@ impl LlmProvider for Provider {
 
             let tool_calls = msg.tool_calls.unwrap_or_default();
             if tool_calls.is_empty() {
-                return Ok(msg.content.unwrap_or_default());
+                let reply = msg.content.unwrap_or_default();
+                if let Some(reason) = guard_reply(&reply, &tools_called) {
+                    tracing::warn!(
+                        "ollama: hallucination guard blocked reply ({reason}) — original: {:?}",
+                        truncate(&reply, 160),
+                    );
+                    return Ok(
+                        "I don't have a confirmed source for that, sir. \
+                         Could you tell me specifically what you'd like me to check?"
+                            .into()
+                    );
+                }
+                return Ok(reply);
             }
 
             let assistant_turn = json!({
@@ -128,6 +153,7 @@ impl LlmProvider for Provider {
                 let args: Value = serde_json::from_str(&tc.function.arguments)
                     .unwrap_or_else(|_| json!({}));
                 tracing::info!("ollama: tool call → {}({})", tc.function.name, args);
+                tools_called.insert(tc.function.name.clone());
                 let result = run_tool(tools_reg, &tc.function.name, &args);
                 tracing::info!("ollama: tool result ← {result}");
                 messages.push(json!({
@@ -173,3 +199,70 @@ struct AssistantMessage {
 struct ToolCall { id: String, function: ToolCallFunction }
 #[derive(Debug, Deserialize)]
 struct ToolCallFunction { name: String, arguments: String }
+
+// ─── hallucination guard ───────────────────────────────────────────────────
+//
+// Coding-tuned LLMs (qwen3-coder, etc.) are notorious for confidently
+// asserting facts they have no source for — "the time is 10:47 AM", "you
+// have a meeting at 11:30", "weather is 72°F" — even when explicit system
+// rules forbid it. Stronger prompts help marginally but the model still
+// drifts.
+//
+// This guard runs over the final assistant text. If the reply contains
+// claims that should have been grounded by a tool call this turn AND the
+// matching tool wasn't actually called, we replace the reply with a
+// refusal. Better to admit we don't know than to lie convincingly.
+//
+// Patterns are anchored on the specific failure modes we've observed,
+// not a fuzzy "looks suspicious" heuristic — false positives erode trust
+// in the assistant.
+
+struct GuardPatterns {
+    /// Explicit clock time: 10:47, 12:30 AM, 9:15pm, 9:15 p.m.
+    clock: Regex,
+    /// Friendly time-of-day greetings ("good morning/afternoon/evening/night")
+    /// — these imply knowledge of the current time.
+    greeting: Regex,
+    /// Weather words (and there's no weather tool in Jarvis right now —
+    /// any weather claim is automatically a hallucination).
+    weather: Regex,
+    /// Calendar/meeting language with specifics — generic "let's set up a
+    /// meeting" won't trip this, "you have a meeting at X" will.
+    calendar: Regex,
+}
+
+fn patterns() -> &'static GuardPatterns {
+    static P: OnceLock<GuardPatterns> = OnceLock::new();
+    P.get_or_init(|| GuardPatterns {
+        clock:    Regex::new(r"(?i)\b\d{1,2}:\d{2}\s*(?:am|pm|a\.m\.|p\.m\.)?\b").unwrap(),
+        greeting: Regex::new(r"(?i)\bgood\s+(?:morning|afternoon|evening|night)\b").unwrap(),
+        weather:  Regex::new(
+            r"(?i)\b(?:weather|cloudy|sunny|rainy?|snowy?|fahrenheit|celsius|temperature|°\s*[fc]|forecast|humidity|breezy|windy)\b"
+        ).unwrap(),
+        calendar: Regex::new(
+            r"(?i)\b(?:meeting|appointment|scheduled|calendar\s+event|your\s+(?:agenda|schedule))\b"
+        ).unwrap(),
+    })
+}
+
+/// Returns Some(reason) if the reply has unsourced claims, None if clean.
+fn guard_reply(reply: &str, tools_called: &HashSet<String>) -> Option<&'static str> {
+    let p = patterns();
+    let time_called = tools_called.contains("get_current_time");
+    let cal_called  = tools_called.contains("list_calendar_events")
+                   || tools_called.contains("create_calendar_event");
+
+    if p.weather.is_match(reply) {
+        return Some("weather claim — no weather tool exists");
+    }
+    if p.clock.is_match(reply) && !time_called {
+        return Some("specific clock time without get_current_time");
+    }
+    if p.greeting.is_match(reply) && !time_called {
+        return Some("time-of-day greeting without get_current_time");
+    }
+    if p.calendar.is_match(reply) && !cal_called {
+        return Some("calendar/meeting claim without list_calendar_events");
+    }
+    None
+}

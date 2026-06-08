@@ -8,7 +8,8 @@
     "dev": "vite",
     "build": "vite build",
     "serve": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "install:app": "pnpm tauri build && pkill -x jarvis 2>/dev/null; rm -rf \"$HOME/Applications/Jarvis.app\" && ditto src-tauri/target/release/bundle/macos/Jarvis.app \"$HOME/Applications/Jarvis.app\" && echo \"\nJarvis installed to $HOME/Applications/Jarvis.app\""
   },
   "license": "MIT",
   "dependencies": {

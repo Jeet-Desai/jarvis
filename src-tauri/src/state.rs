@@ -108,6 +108,22 @@ impl AppState {
         }
     }
 
+    /// Terminal end of a turn that produced no continuation — empty/garbage
+    /// transcript, no samples, brain or TTS failure. Ends conversation mode
+    /// FIRST, then drops to the given resting state.
+    ///
+    /// Use this — never a bare `set(Idle)` — whenever a turn dead-ends.
+    /// Otherwise `session` stays stuck `true` while we sit in Idle, and the
+    /// wake watcher (wake.rs) treats "session active" as "mic is busy" and
+    /// refuses to re-arm the wake word — so the user gets wedged: not
+    /// auto-listening, and "Jarvis" no longer responds. The one transition
+    /// to Idle that must NOT end the session is the transient stop signal in
+    /// `on_vad_stop`, which immediately hands off to `end_recording`.
+    fn end_turn(&self, app: &AppHandle, resting: JarvisState) {
+        self.end_session();
+        self.set(app, resting);
+    }
+
     fn begin_recording(&self, _app: &AppHandle) {
         let Some(pipe) = self.pipe.get() else {
             tracing::error!("mic: pipe not initialized");
@@ -129,7 +145,7 @@ impl AppState {
 
             if result.samples.is_empty() {
                 tracing::warn!("mic: no samples captured");
-                st.set(&app, JarvisState::Idle);
+                st.end_turn(&app, JarvisState::Idle);
                 return;
             }
 
@@ -143,14 +159,14 @@ impl AppState {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::error!("stt: {e}");
-                    st.set(&app, JarvisState::Error);
+                    st.end_turn(&app, JarvisState::Error);
                     return;
                 }
             };
 
             if transcript.is_empty() {
                 tracing::info!("stt: empty transcript");
-                st.set(&app, JarvisState::Idle);
+                st.end_turn(&app, JarvisState::Idle);
                 return;
             }
             let _ = app.emit("jarvis:transcript", transcript.clone());
@@ -161,7 +177,7 @@ impl AppState {
                     "jarvis:response",
                     "No LLM provider configured, sir. Check the env file.".to_string(),
                 );
-                st.set(&app, JarvisState::Idle);
+                st.end_turn(&app, JarvisState::Idle);
                 return;
             };
 
@@ -192,7 +208,7 @@ impl AppState {
                 Ok(h) => Arc::new(h),
                 Err(e) => {
                     tracing::warn!("tts: {e}");
-                    st.set(&app, JarvisState::Idle);
+                    st.end_turn(&app, JarvisState::Idle);
                     return;
                 }
             };

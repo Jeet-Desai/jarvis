@@ -46,11 +46,11 @@ impl Provider {
     }
 
     pub fn base_url(&self) -> &str { &self.base_url }
-    pub fn model(&self)    -> &str { &self.model }
 }
 
 impl LlmProvider for Provider {
     fn name(&self) -> &'static str { "openai" }
+    fn model(&self) -> &str { &self.model }
 
     fn generate(&self, history: &[Message], tools_reg: &[tools::Tool]) -> Result<String> {
         // Build messages array — start with system prompt, then history

@@ -26,10 +26,20 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 cpal = "0.16"
 hound = "3.5"
 dotenvy = "0.15"
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], default-features = false }
+# native-tls → macOS SecureTransport → system keychain.
+# (The previous rustls-tls used bundled webpki roots only.)
+reqwest = { version = "0.12", features = ["json", "native-tls", "blocking"], default-features = false }
 whisper-rs = { version = "0.14", features = ["metal"] }
 rubato = "0.16"
 libc = "0.2"
+# webrtc-vad: classical voice-activity detector ported from Chrome's WebRTC.
+# Replaces the old RMS-threshold VAD which was unreliable in noisy rooms
+# (couldn't distinguish quiet speech from ambient, leading to stuck-in-
+# listening 30 s timeouts). Pure C wrapped via FFI, ~50 KB binary cost.
+webrtc-vad = "0.4"
+# Already a transitive dep — pulling to root so the hallucination guard in
+# brain/ollama.rs can build precompiled patterns instead of string-matching.
+regex = "1"
 base64 = "0.22"
 # MCP client — talks to external tool servers (e.g. @cocal/google-calendar-mcp)
 # over stdio. Optional at runtime — only spawns if user configures credentials.

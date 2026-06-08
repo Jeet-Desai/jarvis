@@ -64,8 +64,9 @@
     ],
     "macOS": {
       "minimumSystemVersion": "12.0",
-      "entitlements": null,
-      "exceptionDomain": null
+      "entitlements": "entitlements.plist",
+      "exceptionDomain": null,
+      "signingIdentity": "Jarvis Code Signing"
     }
   }
 }

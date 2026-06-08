@@ -49,13 +49,14 @@ pub fn start_watcher(app: AppHandle, app_state: Arc<AppState>) {
                     last_action = Instant::now();
                     continue;
                 }
-                // Don't wake-check during an active conversation session — the
-                // mic is being used by the regular Listening flow, no need for
-                // a wake word.
-                if app_state.session_active() {
-                    last_action = Instant::now();
-                    continue;
-                }
+                // NOTE: we deliberately do NOT also skip on `session_active()`.
+                // During a live conversation the state is Listening/Thinking/
+                // Speaking (never Idle), so the check above already covers it.
+                // The only way to be Idle *with* a session still active is the
+                // old stuck-session bug — and `AppState::end_turn` now clears
+                // the session on every dead-end before returning to Idle, so
+                // that state shouldn't occur. Were it to occur anyway, skipping
+                // here would wedge the wake word; refusing to skip self-heals.
                 if last_action.elapsed() < Duration::from_millis(COOLDOWN_MS) {
                     continue;
                 }

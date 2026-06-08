@@ -6,6 +6,8 @@ extern crate objc;
 mod audio;
 mod brain;
 mod mcp;
+#[cfg(target_os = "macos")]
+mod permissions;
 mod state;
 mod stt;
 mod tools;
@@ -382,6 +384,15 @@ pub fn run() {
             jarvis_stop
         ])
         .setup(move |app| {
+            // Fire every TCC prompt that has a programmatic trigger so the
+            // user grants permissions to Jarvis (not osascript / not a shell).
+            // Runs on a background thread — UI shouldn't block on user dialogs.
+            #[cfg(target_os = "macos")]
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(800));
+                permissions::warmup();
+            });
+
             position_orb(app.handle()).ok();
 
             // Convert orb + HUD to NSPanels for reliable fullscreen overlay.

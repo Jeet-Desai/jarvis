@@ -28,22 +28,28 @@ const ROLLING_WINDOW_SECS: f32 = 2.0;
 
 // VAD tuning.
 //
-// Algorithm: exponential-moving-average smoothing of RMS, then a tiny state
-// machine: Silent → Speaking (when smoothed RMS crosses voice threshold for
-// at least MIN_SPEECH_MS cumulative) → Ended (when smoothed RMS stays under
-// the threshold for SILENCE_TO_STOP_MS continuous). Plus a hard
-// MAX_UTTERANCE_MS ceiling so a stuck mic never leaves the user waiting.
+// Algorithm: webrtc-vad (the same VAD Chrome/Firefox WebRTC stacks use)
+// decides voice/non-voice per 30 ms frame. We wrap that with a tiny state
+// machine: accumulate cumulative speech_ms; once MIN_SPEECH_MS has been
+// reached, declare end-of-utterance after SILENCE_TO_STOP_MS continuous
+// non-voice frames. Hard MAX_UTTERANCE_MS ceiling so a stuck mic never
+// leaves the user waiting.
 //
-// Removed the old two-threshold deadband — it could freeze the silence
-// timer if room ambient sat between the two thresholds.
+// Why webrtc-vad over the old RMS-threshold scheme: RMS is just energy.
+// In a quiet room with HVAC + keyboard clicks, the noise floor sits near
+// the speech threshold, so either you raise the threshold (and miss real
+// speech) or lower it (and never detect silence). webrtc-vad uses
+// frequency-band features that distinguish voiced speech from broadband
+// noise regardless of absolute volume.
 //
-// Industry refs: ChatGPT Voice ~500-700ms silence-to-stop, Gemini Live 700ms
-// default. We use 700ms with EMA smoothing for stability.
-const VOICE_RMS_THRESHOLD: f32 = 0.018;   // smoothed RMS above this = speech
-const EMA_ALPHA:           f32 = 0.3;     // higher = react faster to changes
-const MIN_SPEECH_MS:       u64 = 250;     // total speech needed before VAD may fire
-const SILENCE_TO_STOP_MS:  u64 = 700;     // continuous silence after speech → end
-const MAX_UTTERANCE_MS:    u64 = 30_000;  // hard ceiling — force-end if recording runs this long
+// Industry refs: ChatGPT Voice ~500-700 ms silence-to-stop, Gemini Live
+// 700 ms default. We use 700 ms.
+const VAD_RATE_HZ:         u32   = 16_000;  // webrtc-vad supports 8/16/32/48; 16 covers speech bands fine
+const VAD_FRAME_MS:        u64   = 30;      // webrtc-vad accepts 10/20/30
+const VAD_FRAME_SIZE:      usize = (VAD_RATE_HZ as usize * VAD_FRAME_MS as usize) / 1000; // 480
+const MIN_SPEECH_MS:       u64   = 250;     // total speech needed before silence may end utterance
+const SILENCE_TO_STOP_MS:  u64   = 700;     // continuous non-voice after speech → end
+const MAX_UTTERANCE_MS:    u64   = 30_000;  // hard ceiling — force-end if recording runs this long
 
 // Barge-in tuning. We do "AEC lite": for the first GRACE_MS of speech,
 // triggering is suppressed AND we sample the ambient RMS (which is
@@ -159,57 +165,75 @@ impl BargeInDetector {
     }
 }
 
-/// Voice-activity detector with EMA smoothing + a 3-state machine.
-/// One threshold (no deadband). Tracks cumulative speech ms and continuous
-/// silence ms separately so a brief mid-utterance breath doesn't reset speech,
-/// and ambient noise can't freeze silence detection.
-#[derive(Default)]
+/// Voice-activity detector wrapping webrtc-vad. Per-frame voice/non-voice
+/// decisions feed a tiny state machine that fires end-of-utterance once
+/// enough cumulative speech has been seen AND continuous silence has run
+/// past SILENCE_TO_STOP_MS. Hard MAX_UTTERANCE_MS ceiling.
+///
+/// Sample handling: cpal delivers f32 samples at the device's native rate
+/// (typically 48 kHz on macOS). We crudely decimate to 16 kHz and convert
+/// to i16 — webrtc-vad only cares about voiced-speech frequency-band
+/// features, not perfect reconstruction, so anti-alias filtering would be
+/// overkill here.
+// SAFETY: webrtc_vad::Vad holds a *mut Fvad (raw FFI pointer to a struct
+// owned exclusively by this Vad instance). The underlying C library is
+// thread-safe per-instance — no globals, no statics. We only ever access
+// the tracker through `Mutex<VadTracker>` (see PipeInner::vad) so two
+// threads never touch the same Fvad concurrently. The crate author just
+// didn't propagate Send through the FFI wrapper.
+unsafe impl Send for VadTracker {}
+
 struct VadTracker {
-    smoothed_rms:  f32,
-    started_at:    Option<std::time::Instant>,
-    speech_ms:     u64,                    // cumulative voiced duration this utterance
-    last_voice_at: Option<std::time::Instant>,
-    last_sample_at: Option<std::time::Instant>,
-    triggered:     bool,
+    vad: webrtc_vad::Vad,
+    /// i16 samples at VAD_RATE_HZ waiting to fill one webrtc-vad frame.
+    frame_buf: Vec<i16>,
+    /// Fractional decimation phase carried across batches so we don't
+    /// drift in/out of alignment when device_rate ÷ VAD_RATE_HZ isn't
+    /// an integer.
+    decim_pos: f32,
+    started_at:     Option<std::time::Instant>,
+    speech_ms:      u64,
+    last_voice_at:  Option<std::time::Instant>,
+    triggered:      bool,
+}
+
+impl Default for VadTracker {
+    fn default() -> Self {
+        Self {
+            vad: webrtc_vad::Vad::new_with_rate_and_mode(
+                webrtc_vad::SampleRate::Rate16kHz,
+                // Aggressive: webrtc-vad's most selective mode short of
+                // VeryAggressive. We want to err on the side of marking
+                // ambiguous frames as non-voice so the silence timer can
+                // fire — otherwise we're back to the stuck-listening bug.
+                webrtc_vad::VadMode::Aggressive,
+            ),
+            frame_buf: Vec::with_capacity(VAD_FRAME_SIZE * 2),
+            decim_pos: 0.0,
+            started_at: None,
+            speech_ms: 0,
+            last_voice_at: None,
+            triggered: false,
+        }
+    }
 }
 
 impl VadTracker {
     fn reset(&mut self) {
-        self.smoothed_rms   = 0.0;
-        self.started_at     = None;
-        self.speech_ms      = 0;
-        self.last_voice_at  = None;
-        self.last_sample_at = None;
-        self.triggered      = false;
+        self.frame_buf.clear();
+        self.decim_pos = 0.0;
+        self.started_at = None;
+        self.speech_ms = 0;
+        self.last_voice_at = None;
+        self.triggered = false;
     }
 
-    fn process(&mut self, rms: f32) -> bool {
+    fn process_samples(&mut self, samples: &[f32], device_rate: u32) -> bool {
         if self.triggered { return false; }
         let now = std::time::Instant::now();
-
-        // First-sample bootstrap
         if self.started_at.is_none() {
-            self.started_at     = Some(now);
-            self.last_sample_at = Some(now);
-            self.smoothed_rms   = rms;
-            return false;
+            self.started_at = Some(now);
         }
-
-        // EMA smoothing — flattens noise spikes that would otherwise reset speech
-        self.smoothed_rms = self.smoothed_rms * (1.0 - EMA_ALPHA) + rms * EMA_ALPHA;
-
-        let dt_ms = self.last_sample_at
-            .map(|t| now.duration_since(t).as_millis() as u64)
-            .unwrap_or(0);
-        self.last_sample_at = Some(now);
-
-        let is_voice = self.smoothed_rms > VOICE_RMS_THRESHOLD;
-        if is_voice {
-            self.speech_ms = self.speech_ms.saturating_add(dt_ms);
-            self.last_voice_at = Some(now);
-        }
-
-        // Hard timeout — force-end no matter what so user never gets stuck
         if let Some(start) = self.started_at {
             if now.duration_since(start).as_millis() as u64 >= MAX_UTTERANCE_MS {
                 tracing::warn!("vad: hit MAX_UTTERANCE_MS, forcing end");
@@ -218,13 +242,34 @@ impl VadTracker {
             }
         }
 
-        // End-of-utterance: enough cumulative speech, then enough continuous silence
-        if self.speech_ms >= MIN_SPEECH_MS {
-            if let Some(last_v) = self.last_voice_at {
-                let silence_ms = now.duration_since(last_v).as_millis() as u64;
-                if !is_voice && silence_ms >= SILENCE_TO_STOP_MS {
-                    self.triggered = true;
-                    return true;
+        // Decimate device_rate → VAD_RATE_HZ. step = e.g. 3.0 for 48 → 16.
+        // Pull samples by integer index, advance pos by step; carry the
+        // fractional remainder into the next batch.
+        let step = device_rate as f32 / VAD_RATE_HZ as f32;
+        let mut pos = self.decim_pos;
+        while (pos as usize) < samples.len() {
+            let s = samples[pos as usize].clamp(-1.0, 1.0);
+            self.frame_buf.push((s * i16::MAX as f32) as i16);
+            pos += step;
+        }
+        self.decim_pos = pos - samples.len() as f32;
+        if self.decim_pos < 0.0 { self.decim_pos = 0.0; }
+
+        // Drain complete webrtc-vad frames.
+        while self.frame_buf.len() >= VAD_FRAME_SIZE {
+            let frame: Vec<i16> = self.frame_buf.drain(..VAD_FRAME_SIZE).collect();
+            let is_voice = self.vad.is_voice_segment(&frame).unwrap_or(false);
+            if is_voice {
+                self.speech_ms = self.speech_ms.saturating_add(VAD_FRAME_MS);
+                self.last_voice_at = Some(now);
+            }
+            if self.speech_ms >= MIN_SPEECH_MS {
+                if let Some(last_v) = self.last_voice_at {
+                    let silence_ms = now.duration_since(last_v).as_millis() as u64;
+                    if !is_voice && silence_ms >= SILENCE_TO_STOP_MS {
+                        self.triggered = true;
+                        return true;
+                    }
                 }
             }
         }
@@ -286,14 +331,20 @@ pub fn start_pipe(app: AppHandle) -> Result<AudioPipe> {
         let _ = inner_for_thread.rolling_max.set(rolling_max);
 
         macro_rules! handle_batch {
-            ($lvl:expr, $append:expr) => {{
-                let lvl: f32 = $lvl;
+            ($samples:expr) => {{
+                // Convert once to f32 — we need the slice form for both
+                // the rolling buffer / recording buffer (which store f32)
+                // AND for webrtc-vad (which wants raw samples, not an
+                // already-aggregated RMS). The per-batch allocation here
+                // is fine — cpal batches arrive every ~10-100 ms.
+                let samples: Vec<f32> = $samples;
+                let lvl = rms_f32(&samples);
                 let _ = app.emit("jarvis:level", lvl);
 
                 // Always push into the rolling buffer (for wake detection)
                 {
                     let mut roll = inner_for_thread.rolling.lock();
-                    for s in $append { roll.push_back(s); }
+                    for &s in &samples { roll.push_back(s); }
                     while roll.len() > rolling_max {
                         roll.pop_front();
                     }
@@ -302,14 +353,15 @@ pub fn start_pipe(app: AppHandle) -> Result<AudioPipe> {
                 // Buffer for active recording if state machine asked
                 let recording = inner_for_thread.is_recording.load(Ordering::Acquire);
                 if recording {
-                    inner_for_thread.buffer.lock().extend($append);
-                    if inner_for_thread.vad.lock().process(lvl) {
+                    inner_for_thread.buffer.lock().extend(samples.iter().copied());
+                    if inner_for_thread.vad.lock().process_samples(&samples, sample_rate) {
                         tracing::info!("vad: end-of-utterance");
                         let _ = app.emit("jarvis:vad_stop", ());
                     }
                 }
 
-                // Barge-in: only while Jarvis is speaking aloud
+                // Barge-in: only while Jarvis is speaking aloud (still
+                // RMS-based — that path's tuning isn't broken).
                 if inner_for_thread.is_speaking_mode.load(Ordering::Acquire) {
                     if inner_for_thread.barge_in.lock().process(lvl) {
                         tracing::info!("barge-in: user interrupted (level={:.3})", lvl);
@@ -323,7 +375,7 @@ pub fn start_pipe(app: AppHandle) -> Result<AudioPipe> {
             cpal::SampleFormat::F32 => device.build_input_stream(
                 &config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    handle_batch!(rms_f32(data), data.iter().copied());
+                    handle_batch!(data.to_vec());
                 },
                 err_fn,
                 None,
@@ -331,10 +383,7 @@ pub fn start_pipe(app: AppHandle) -> Result<AudioPipe> {
             cpal::SampleFormat::I16 => device.build_input_stream(
                 &config,
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                    handle_batch!(
-                        rms_i16(data),
-                        data.iter().map(|&x| x as f32 / i16::MAX as f32)
-                    );
+                    handle_batch!(data.iter().map(|&x| x as f32 / i16::MAX as f32).collect());
                 },
                 err_fn,
                 None,
@@ -342,10 +391,7 @@ pub fn start_pipe(app: AppHandle) -> Result<AudioPipe> {
             cpal::SampleFormat::U16 => device.build_input_stream(
                 &config,
                 move |data: &[u16], _: &cpal::InputCallbackInfo| {
-                    handle_batch!(
-                        rms_u16(data),
-                        data.iter().map(|&x| (x as f32 - 32768.0) / 32768.0)
-                    );
+                    handle_batch!(data.iter().map(|&x| (x as f32 - 32768.0) / 32768.0).collect());
                 },
                 err_fn,
                 None,

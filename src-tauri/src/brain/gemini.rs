@@ -1,3 +1,4 @@
+
 //! Google Gemini provider (gemini-2.5-flash-lite by default).
 //!
 //! Configured via env:

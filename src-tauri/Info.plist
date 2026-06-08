@@ -2,9 +2,84 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+    <!-- Mic / camera / screen capture -->
     <key>NSMicrophoneUsageDescription</key>
-    <string>Jarvis needs microphone access to hear your voice commands.</string>
+    <string>Jarvis needs the microphone to hear your voice commands.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Jarvis uses the camera for vision-based assistance when you ask.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Jarvis captures the screen to answer visual questions about what you're looking at.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Jarvis transcribes your speech to understand voice commands.</string>
+
+    <!-- Automation / accessibility / input -->
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Jarvis controls other applications (browsers, Finder, System Events) to read context and act on your behalf.</string>
+    <key>NSAccessibilityUsageDescription</key>
+    <string>Jarvis uses accessibility APIs to read on-screen content and simulate keystrokes when assisting you.</string>
+    <key>NSInputMonitoringUsageDescription</key>
+    <string>Jarvis monitors keyboard input to handle global hotkeys and contextual assistance.</string>
+    <key>NSSystemAdministrationUsageDescription</key>
+    <string>Jarvis performs system-level actions on your behalf.</string>
+
+    <!-- Local data sources -->
+    <key>NSContactsUsageDescription</key>
+    <string>Jarvis reads your contacts to send messages and look up people you mention.</string>
+    <key>NSCalendarsUsageDescription</key>
+    <string>Jarvis reads and writes your calendar to manage meetings.</string>
+    <key>NSRemindersUsageDescription</key>
+    <string>Jarvis reads and writes your reminders.</string>
+    <key>NSPhotoLibraryUsageDescription</key>
+    <string>Jarvis accesses your photo library when you ask about images.</string>
+    <key>NSPhotoLibraryAddUsageDescription</key>
+    <string>Jarvis saves screenshots and generated images to your photo library.</string>
+
+    <!-- Location / Bluetooth -->
+    <key>NSLocationUsageDescription</key>
+    <string>Jarvis uses your location for context-aware assistance.</string>
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>Jarvis uses your location for context-aware assistance.</string>
+    <key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+    <string>Jarvis uses your location for context-aware assistance.</string>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>Jarvis uses Bluetooth to interact with nearby devices.</string>
+    <key>NSBluetoothPeripheralUsageDescription</key>
+    <string>Jarvis uses Bluetooth to interact with nearby devices.</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Jarvis communicates with services on your local network.</string>
+
+    <!-- Filesystem (TCC) -->
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>Jarvis reads and writes files in your Desktop folder when assisting you.</string>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>Jarvis reads and writes files in your Documents folder when assisting you.</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>Jarvis reads and writes files in your Downloads folder when assisting you.</string>
+    <key>NSRemovableVolumesUsageDescription</key>
+    <string>Jarvis reads and writes files on removable drives.</string>
+    <key>NSNetworkVolumesUsageDescription</key>
+    <string>Jarvis reads and writes files on network volumes.</string>
+    <key>NSFileProviderDomainUsageDescription</key>
+    <string>Jarvis reads files from cloud storage providers (iCloud, Dropbox, etc.).</string>
+    <key>NSFileProviderPresenceUsageDescription</key>
+    <string>Jarvis sees which files are open in cloud storage.</string>
+
+    <!-- Media library -->
+    <key>NSAppleMusicUsageDescription</key>
+    <string>Jarvis controls Apple Music playback on your request.</string>
+    <key>NSMotionUsageDescription</key>
+    <string>Jarvis uses motion data for context-aware assistance.</string>
+    <key>NSFocusStatusUsageDescription</key>
+    <string>Jarvis respects your Focus / Do Not Disturb status.</string>
+    <key>NSUserTrackingUsageDescription</key>
+    <string>Jarvis adapts its behavior based on usage patterns.</string>
+
+    <!-- App behavior -->
     <key>LSUIElement</key>
+    <false/>
+    <key>NSSupportsAutomaticTermination</key>
+    <false/>
+    <key>NSSupportsSuddenTermination</key>
     <false/>
 </dict>
 </plist>

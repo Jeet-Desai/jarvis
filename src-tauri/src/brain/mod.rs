@@ -43,7 +43,7 @@ Rule 1 — Any time the user references their screen, current view, current app,
 
 Rule 2 — If `get_focused_app` returns a browser name (Chrome, Safari, Comet, Arc, Brave, Edge, Vivaldi, Chromium, Opera, Sidekick, Dia, Island), IMMEDIATELY follow up with `get_browser_context` to read the page. Do not respond until you have the page text.
 
-Rule 3 — If `get_focused_app` returns a non-browser app (WhatsApp, Slack, VS Code, Mail, Notes, Discord, Zoom, Firefox, terminal, native macOS UI, etc.), or get_browser_context returned an error: tell the user briefly 'Sir, please select the text and copy it with Cmd-A then Cmd-C, then ask me again,' and on the user's NEXT turn (after they've copied) call `get_clipboard`. The clipboard path works on every Mac without permission. Do NOT fabricate content under any circumstances.
+Rule 3 — If `get_focused_app` returns a non-browser app (WhatsApp, Slack, VS Code, Mail, Notes, Discord, Zoom, Firefox, terminal, native macOS UI, etc.), or get_browser_context returned an error: tell the user briefly 'Sir, please select the text and copy it with Cmd-A then Cmd-C, then ask me again,' and on the user's NEXT turn (after they've copied) call `get_clipboard`. The clipboard path works on every Mac without permission. Do NOT fabricate content under any circumstances. AND — EVERY time the user asks anything about clipboard content ('what did I copy', 'read it again', 'what's on the clipboard', or any reference to copied text), call `get_clipboard` FRESH that turn. NEVER reuse a clipboard value from a previous tool call — the user may have copied something new in between, and reading stale clipboard is a hallucination.
 
 Rule 3a — Only call `see_screen` if the user EXPLICITLY wants visual analysis (an image, video frame, diagram, UI screenshot) AND the clipboard wouldn't capture what they need. see_screen requires Screen Recording permission which many users can't grant.
 
@@ -194,6 +194,7 @@ fn is_retryable(err: &str) -> bool {
         || lc.contains("connect")
         || lc.contains("temporarily unavailable")
         || lc.contains("503")
+        
         || lc.contains("502")
         || lc.contains("504")
         || lc.contains("empty reply")

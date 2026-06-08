@@ -9,6 +9,8 @@
 use anyhow::Result;
 use serde_json::{json, Value};
 
+use crate::brain;
+
 /// One callable tool: Gemini sees the `declaration`, and when it issues a
 /// `functionCall` with this name we run `handler` and feed the result back.
 pub struct Tool {
@@ -20,6 +22,15 @@ pub struct Tool {
 /// Returns every tool Jarvis has. Order doesn't matter.
 pub fn registry() -> Vec<Tool> {
     vec![
+        Tool {
+            name: "get_brain_info",
+            declaration: json!({
+                "name": "get_brain_info",
+                "description": "Return the ground-truth identity of the LLM provider(s) and model(s) currently running this assistant. Use whenever the user asks 'what model are you', 'which LLM', 'which provider', 'are you GPT / Gemini / Claude / Ollama', 'what brain am I talking to'. Returns the configured fallback order with concrete model names — the first entry is what's serving this turn unless a fallback was triggered. Do NOT guess model identity from training data; always call this tool.",
+                "parameters": { "type": "object", "properties": {} }
+            }),
+            handler: get_brain_info,
+        },
         Tool {
             name: "get_current_time",
             declaration: json!({
@@ -112,9 +123,85 @@ pub fn registry() -> Vec<Tool> {
             }),
             handler: create_calendar_event,
         },
-        // Future: send_message, set_clipboard,
-        //         read_screen_via_accessibility, click_at_xy, …
+        Tool {
+            name: "type_text",
+            declaration: json!({
+                "name": "type_text",
+                "description": "Type / write / paste text into another app on the user's Mac. Use whenever the user says 'type X into Y', 'write this in Z', 'paste my answer into [app]', 'enter this query in [app]'. Default target is whatever app is currently focused; pass `app_name` to bring a different app to front first (e.g. 'Codex', 'ChatGPT', 'Google Chrome', 'Slack', 'iMessage'). Pass `submit=true` to press Return after typing (use for chat boxes / search bars where the user wants the text sent, not just entered). Uses clipboard-paste under the hood so all characters (emoji, code, multi-line) work. Restores the user's original clipboard afterward. Requires Accessibility + Automation, both granted to Jarvis.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text":     { "type": "string",  "description": "The text to type." },
+                        "app_name": { "type": "string",  "description": "Optional. Exact name of the macOS app to focus before typing (e.g. 'Codex'). If omitted, types into whichever app is currently focused." },
+                        "submit":   { "type": "boolean", "description": "Optional. If true, press Return/Enter after typing. Default false." }
+                    },
+                    "required": ["text"]
+                }
+            }),
+            handler: type_text,
+        },
+        Tool {
+            name: "set_clipboard",
+            declaration: json!({
+                "name": "set_clipboard",
+                "description": "Write text to the user's clipboard so they can paste it themselves with Cmd+V. Use when the user asks you to 'copy X to clipboard', 'put X on my clipboard', or when text is long enough that asking them to paste is friendlier than auto-typing.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": { "type": "string", "description": "Text to place on the clipboard." }
+                    },
+                    "required": ["text"]
+                }
+            }),
+            handler: set_clipboard,
+        },
+        Tool {
+            name: "focus_app",
+            declaration: json!({
+                "name": "focus_app",
+                "description": "Bring a macOS app to the front (focus it). Use when the user says 'open X', 'switch to Y', 'go to Z', or before any other tool that needs that app focused. Activates the app if running; launches it if installed but not running.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "app_name": { "type": "string", "description": "Exact macOS app name (e.g. 'Codex', 'Google Chrome', 'Slack')." }
+                    },
+                    "required": ["app_name"]
+                }
+            }),
+            handler: focus_app,
+        },
+        Tool {
+            name: "send_shortcut",
+            declaration: json!({
+                "name": "send_shortcut",
+                "description": "Send a macOS keyboard shortcut to the focused app. Use for ⌘F (find/search), ⌘N (new chat/document), ⌘S (save), ⌘W (close), ⌘T (new tab), Escape, arrow keys, Tab, etc. — anything that ISN'T literal text. CRITICAL use case: when opening a chat in messaging apps (WhatsApp, Slack, iMessage, Discord, Telegram), the focused state is usually NOT the search field. First call send_shortcut with key='f' modifiers=['cmd'] (⌘F) or key='n' modifiers=['cmd'] (⌘N) to focus the search/new-chat field, THEN call type_text with the name and submit=true. Requires Accessibility permission, already granted to Jarvis.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "key": { "type": "string", "description": "The key to press. Either a single literal character ('f', 'n', '/', '?', '1'), or a named special key: 'return', 'escape', 'space', 'tab', 'delete', 'left', 'right', 'up', 'down', 'home', 'end', 'pageup', 'pagedown'." },
+                        "modifiers": { "type": "array", "items": { "type": "string" }, "description": "Optional modifier keys held while pressing. Allowed values: 'cmd' (or 'command'), 'shift', 'option' (or 'alt'), 'control' (or 'ctrl'). Use ['cmd'] for ⌘F, ['cmd','shift'] for ⌘⇧P, etc. Omit for unmodified keys like plain Escape." }
+                    },
+                    "required": ["key"]
+                }
+            }),
+            handler: send_shortcut,
+        },
+        // Future: read_screen_via_accessibility, click_at_xy, …
     ]
+}
+
+fn get_brain_info(_args: &Value) -> Result<Value> {
+    match brain::brain_info() {
+        Some(info) => Ok(json!({
+            "providers_in_order": info.providers_in_order,
+            "primary":            info.providers_in_order.first(),
+            "vision_model":       info.vision_model,
+            "note":               "The first provider serves each turn; on retryable errors (rate limit / timeout) the brain falls back to the next. Vision (see_screen) always uses the listed vision_model regardless of brain provider.",
+        })),
+        None => Ok(json!({
+            "error": "brain not initialized yet — get_brain_info called before Brain::from_env",
+        })),
+    }
 }
 
 fn get_current_time(_args: &Value) -> Result<Value> {
@@ -228,6 +315,23 @@ fn osascript(script: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Escape a string so it can be safely embedded inside an AppleScript
+/// double-quoted literal. Without this, any value interpolated into a
+/// `tell application "..."` template can break out of the string and inject
+/// arbitrary AppleScript — which has `do shell script`, i.e. command
+/// execution. The values we interpolate (tool `app_name`, keystroke text)
+/// are LLM-controlled, and the LLM ingests untrusted web-page text via
+/// `get_browser_context`, so this is a real prompt-injection → RCE path.
+/// Escaping keeps the value confined to the string literal; a hostile name
+/// at worst yields "app not found", never code execution.
+fn applescript_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Screenshot + vision — uses Gemini multimodal regardless of which LLM the
 // main brain is using. Vision is encapsulated inside the tool so the
@@ -278,6 +382,199 @@ fn normalize_calendar_args(args: &Value) -> Value {
         obj.insert("calendarId".into(), Value::String("primary".into()));
     }
     Value::Object(obj)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Action tools — type text, focus apps, set clipboard. These are the "do
+// things on the user's Mac" tools (vs the read-only ones above). They rely
+// on Accessibility (System Events keystroke) + AppleEvents (tell app to
+// activate) — both granted to Jarvis at first launch.
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn type_text(args: &Value) -> Result<Value> {
+    use std::io::Write;
+
+    let text = args
+        .get("text")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("missing required field: text"))?;
+    let app_name = args
+        .get("app_name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(str::trim);
+    let submit = args.get("submit").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    // Stash old clipboard so we can restore it after the paste.
+    let old_clip = std::process::Command::new("pbpaste")
+        .output()
+        .ok()
+        .map(|o| o.stdout);
+
+    // Put our text on the clipboard.
+    write_clipboard(text)?;
+
+    // Focus the target app if specified. Use Launch Services (open -a)
+    // so Catalyst / sandboxed apps work; AppleScript activate fails on them.
+    if let Some(app) = app_name {
+        let _ = std::process::Command::new("open").arg("-a").arg(app).status();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+
+    // Paste (⌘V).
+    osascript(r#"tell application "System Events" to keystroke "v" using command down"#)?;
+
+    if submit {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        // key code 36 = Return
+        osascript(r#"tell application "System Events" to key code 36"#)?;
+    }
+
+    // Restore prior clipboard contents after the paste has had time to land.
+    if let Some(old) = old_clip {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut child = std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()?;
+        if let Some(stdin) = child.stdin.as_mut() {
+            let _ = stdin.write_all(&old);
+        }
+        let _ = child.wait();
+    }
+
+    Ok(json!({
+        "ok": true,
+        "typed_into": app_name.unwrap_or("focused app"),
+        "submitted": submit,
+        "chars": text.chars().count(),
+    }))
+}
+
+fn send_shortcut(args: &Value) -> Result<Value> {
+    let key = args
+        .get("key")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("missing required field: key"))?;
+    let modifiers: Vec<String> = args
+        .get("modifiers")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.as_str().map(|s| s.trim().to_lowercase()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mod_strs: Vec<&str> = modifiers
+        .iter()
+        .filter_map(|m| match m.as_str() {
+            "cmd" | "command" | "meta" | "super" => Some("command down"),
+            "shift" => Some("shift down"),
+            "option" | "opt" | "alt" => Some("option down"),
+            "control" | "ctrl" => Some("control down"),
+            _ => None,
+        })
+        .collect();
+    let using_clause = if mod_strs.is_empty() {
+        String::new()
+    } else {
+        format!(" using {{{}}}", mod_strs.join(", "))
+    };
+
+    let key_lc = key.to_lowercase();
+    let key_code: Option<u16> = match key_lc.as_str() {
+        "return" | "enter" => Some(36),
+        "escape" | "esc" => Some(53),
+        "space" => Some(49),
+        "tab" => Some(48),
+        "delete" | "backspace" => Some(51),
+        "forwarddelete" | "fwddelete" => Some(117),
+        "left" | "leftarrow" => Some(123),
+        "right" | "rightarrow" => Some(124),
+        "down" | "downarrow" => Some(125),
+        "up" | "uparrow" => Some(126),
+        "home" => Some(115),
+        "end" => Some(119),
+        "pageup" => Some(116),
+        "pagedown" => Some(121),
+        _ => None,
+    };
+
+    let script = if let Some(code) = key_code {
+        format!(r#"tell application "System Events" to key code {code}{using_clause}"#)
+    } else {
+        let escaped = applescript_escape(key);
+        format!(r#"tell application "System Events" to keystroke "{escaped}"{using_clause}"#)
+    };
+
+    osascript(&script)?;
+    Ok(json!({
+        "ok": true,
+        "key": key,
+        "modifiers": modifiers,
+    }))
+}
+
+fn set_clipboard(args: &Value) -> Result<Value> {
+    let text = args
+        .get("text")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing required field: text"))?;
+    write_clipboard(text)?;
+    Ok(json!({ "ok": true, "chars": text.chars().count() }))
+}
+
+fn focus_app(args: &Value) -> Result<Value> {
+    let app = args
+        .get("app_name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("missing required field: app_name"))?;
+
+    // `open -a` goes through Launch Services and works for Catalyst,
+    // Electron, native, and sandboxed apps. AppleScript activate fails
+    // with -1728 on sandboxed Catalyst apps like WhatsApp.
+    let ls = std::process::Command::new("open").arg("-a").arg(app).output();
+    let launched_via_ls = matches!(&ls, Ok(o) if o.status.success());
+    if launched_via_ls {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        return Ok(json!({ "ok": true, "focused": app, "method": "launch_services" }));
+    }
+
+    // Fallback: try AppleScript activate (works for some scriptable apps
+    // that Launch Services can't find by display name). Escape the name —
+    // it's LLM-supplied and would otherwise allow AppleScript injection.
+    if osascript(&format!(r#"tell application "{}" to activate"#, applescript_escape(app))).is_ok() {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        return Ok(json!({ "ok": true, "focused": app, "method": "applescript" }));
+    }
+
+    let stderr = ls.ok()
+        .map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
+        .unwrap_or_default();
+    Ok(json!({
+        "error": format!(
+            "Couldn't focus '{app}'. Both Launch Services and AppleScript failed. \
+             Verify the app's exact name (in Dock or /Applications); common gotcha: \
+             '{app}' might actually be 'WhatsApp Web', 'Slack', 'Visual Studio Code', etc. \
+             open-a stderr: {stderr}"
+        )
+    }))
+}
+
+fn write_clipboard(text: &str) -> Result<()> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("pbcopy")
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(text.as_bytes())?;
+    }
+    child.wait()?;
+    Ok(())
 }
 
 fn get_clipboard(_args: &Value) -> Result<Value> {
