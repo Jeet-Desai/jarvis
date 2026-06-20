@@ -19,6 +19,56 @@ A Tony Stark-style voice assistant for macOS. Always-on wake word, a holographic
 
 ---
 
+## JARVIS 2.0 — computer control
+
+Jarvis can now *operate the Mac*, not just talk about it. Ask it to open an app,
+find and click a button, type into a field, run a command, or read/write a file —
+and it does it the way you would, through the real UI and shell.
+
+**Capabilities (built-in tools the brain can call):**
+
+- **Understand the screen** — `read_screen_elements` reads the focused app's
+  interactive UI (buttons, fields, links, menu items) with on-screen coordinates
+  via the macOS Accessibility API.
+- **Act** — `click_element` (click by visible label), `click` / `move_mouse` /
+  `scroll` (coordinates), `send_shortcut` (any key combo, via native input),
+  `type_text`, `focus_app` / `list_apps` / `quit_app`.
+- **Real work via the shell** — `run_shell` (run a command, capture output, with a
+  timeout), `read_file` / `write_file` / `list_dir` / `search_files`.
+- Native input is **cross-platform** (`enigo` → CoreGraphics on macOS, SendInput on
+  Windows), so the control layer is built to port.
+
+**Configurable safety boundaries.** Every action passes through a policy gate
+before it runs. Set the mode in `.env` (`JARVIS_POLICY_MODE=safe|trusted|dev`,
+or `JARVIS_UNRESTRICTED=1`) or edit the auto-generated `policy.toml` in the app
+config dir for fine-grained allow/deny lists:
+
+| Mode | Behaviour |
+|---|---|
+| `safe` *(default)* | Read-only actions run silently; anything that **changes** the machine asks first. |
+| `trusted` | Read-only + mutations (click/type/app-switch) run silently; **destructive** actions (shell, write/delete files, quit apps) and any action driven by untrusted web/screen content still ask. |
+| `dev` | **Unrestricted** — everything runs without asking (still audit-logged). Owner/dev use only. |
+
+- **Confirmations** are spoken aloud + shown on the orb/HUD, and answered by the
+  **HUD buttons**, **`⇧⌘Y`** (approve), **`⇧⌘S`** (deny/stop), or a timeout (→ deny).
+- **Prompt-injection guard** — text read from the screen, a web page, the clipboard,
+  or a file is treated as *data, never instructions*; a mutation in a turn that read
+  untrusted content is force-confirmed even in `trusted` mode.
+- **Protected by default** — credential locations (`~/.ssh`, `~/.aws`, Keychain, …)
+  and obviously-destructive shell patterns are denied (advisory second layer; the
+  real gate is confirmation). Paths are canonicalized so `..`/symlink tricks can't
+  slip past.
+- **Audit log** — every gated action is appended to `audit.jsonl` in the app data dir.
+- A live **activity feed** in the HUD shows each action's status; the HUD also shows
+  the current policy mode.
+
+> **Cross-platform:** the control layer, policy engine, confirmation flow, and UI are
+> OS-agnostic by design (trait-based platform seam in `src-tauri/src/control/`). macOS
+> is complete; the **Windows** port (UI Automation backend + platform shims) is the
+> next milestone — see `control/windows.rs`.
+
+---
+
 ## Requirements
 
 | | |

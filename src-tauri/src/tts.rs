@@ -15,6 +15,7 @@
 use anyhow::Result;
 use parking_lot::Mutex;
 use std::process::{Child, Command};
+use std::time::{Duration, Instant};
 
 const DEFAULT_VOICE:    &str = "Daniel";
 const DEFAULT_RATE_WPM: u32  = 195;
@@ -24,15 +25,35 @@ pub struct SpeechHandle {
     pid: Option<u32>,
     /// Child object — locked exclusively by wait_blocking
     child: Mutex<Option<Child>>,
+    /// Hard ceiling (seconds) on how long we'll wait for `say` to finish, so a
+    /// wedged TTS subprocess can never hang a turn — critical now that turns
+    /// chain autonomously in conversation mode.
+    max_secs: u64,
 }
 
 impl SpeechHandle {
-    /// Block until the subprocess exits (normal end of speech) OR until
-    /// `kill()` is called from another thread.
+    /// Block until the subprocess exits (normal end of speech), until `kill()`
+    /// is called from another thread, OR until `max_secs` elapses (then we
+    /// force-kill and return). Polls so the kill paths stay responsive.
     pub fn wait_blocking(&self) -> Result<()> {
         let opt = self.child.lock().take();
         if let Some(mut c) = opt {
-            let _ = c.wait()?;
+            let start = Instant::now();
+            let max = Duration::from_secs(self.max_secs.max(1));
+            loop {
+                match c.try_wait()? {
+                    Some(_) => break,
+                    None => {
+                        if start.elapsed() > max {
+                            tracing::warn!("tts: exceeded {}s ceiling — killing `say`", self.max_secs);
+                            let _ = c.kill();
+                            let _ = c.wait();
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(40));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -53,7 +74,7 @@ impl SpeechHandle {
 pub fn start_speaking(text: &str) -> Result<SpeechHandle> {
     let text = text.trim();
     if text.is_empty() {
-        return Ok(SpeechHandle { pid: None, child: Mutex::new(None) });
+        return Ok(SpeechHandle { pid: None, child: Mutex::new(None), max_secs: 0 });
     }
 
     let voice = std::env::var("JARVIS_VOICE").unwrap_or_else(|_| DEFAULT_VOICE.into());
@@ -71,7 +92,10 @@ pub fn start_speaking(text: &str) -> Result<SpeechHandle> {
         .spawn()?;
 
     let pid = child.id();
-    Ok(SpeechHandle { pid: Some(pid), child: Mutex::new(Some(child)) })
+    // Generous ceiling from length: ~16 chars/sec at default rate, so /8 gives
+    // ~2× headroom, +8s slack, capped at 3 minutes.
+    let max_secs = ((text.chars().count() as u64) / 8 + 8).min(180);
+    Ok(SpeechHandle { pid: Some(pid), child: Mutex::new(Some(child)), max_secs })
 }
 
 fn truncate(s: &str, max_bytes: usize) -> &str {

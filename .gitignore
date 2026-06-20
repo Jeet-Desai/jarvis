@@ -29,4 +29,5 @@ models/
 .idea/
 *.swp
 *.swo
+*.code-workspace
 

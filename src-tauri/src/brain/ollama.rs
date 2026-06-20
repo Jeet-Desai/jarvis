@@ -121,6 +121,15 @@ impl LlmProvider for Provider {
                 .ok_or_else(|| anyhow!("ollama: no choices"))?;
             let msg = choice.message;
 
+            // Log the assistant's own text (its reasoning / plan for this round)
+            // so we can see WHY it chose the tools it did — not just which.
+            if let Some(c) = msg.content.as_deref() {
+                let c = c.trim();
+                if !c.is_empty() {
+                    tracing::info!("ollama[round {round}]: assistant ← {}", truncate(c, 600));
+                }
+            }
+
             let tool_calls = msg.tool_calls.unwrap_or_default();
             if tool_calls.is_empty() {
                 let reply = msg.content.unwrap_or_default();
@@ -150,11 +159,21 @@ impl LlmProvider for Provider {
             messages.push(assistant_turn);
 
             for tc in tool_calls {
-                let args: Value = serde_json::from_str(&tc.function.arguments)
-                    .unwrap_or_else(|_| json!({}));
-                tracing::info!("ollama: tool call → {}({})", tc.function.name, args);
                 tools_called.insert(tc.function.name.clone());
-                let result = run_tool(tools_reg, &tc.function.name, &args);
+                let result = match serde_json::from_str::<Value>(&tc.function.arguments) {
+                    Ok(args) => {
+                        tracing::info!("ollama: tool call → {}({})", tc.function.name, args);
+                        crate::tools::dispatch(tools_reg, &tc.function.name, &args)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "ollama: bad tool args for {} ({e}): {}",
+                            tc.function.name,
+                            truncate(&tc.function.arguments, 200)
+                        );
+                        json!({ "error": format!("Could not parse tool arguments as JSON ({e}). Re-issue the call with valid JSON arguments.") })
+                    }
+                };
                 tracing::info!("ollama: tool result ← {result}");
                 messages.push(json!({
                     "role": "tool",
@@ -165,16 +184,6 @@ impl LlmProvider for Provider {
             tracing::debug!("ollama: round {round} → tool loop");
         }
         bail!("ollama: exceeded MAX_TOOL_ROUNDS")
-    }
-}
-
-fn run_tool(tools_reg: &[tools::Tool], name: &str, args: &Value) -> Value {
-    let Some(t) = tools_reg.iter().find(|t| t.name == name) else {
-        return json!({ "error": format!("unknown tool: {name}") });
-    };
-    match (t.handler)(args) {
-        Ok(v)  => v,
-        Err(e) => json!({ "error": e.to_string() }),
     }
 }
 

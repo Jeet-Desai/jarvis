@@ -109,6 +109,94 @@ pub fn describe_screen(query: &str) -> Result<String> {
     bail!("vision: all providers failed — {}", errors.join("  |  "))
 }
 
+/// Visual grounding: ask the vision model WHERE a described element is, as
+/// fractions of the screenshot (origin top-left, each in [0,1]). The caller
+/// scales these to screen points for clicking — fractions avoid needing the
+/// image's pixel dims or the Retina backing-scale. Returns (x_frac, y_frac,
+/// found). This is the fallback for "click the thing I can see" when the
+/// accessibility tree has no usable label (custom web buttons, icons, canvas).
+pub fn locate_on_screen(description: &str) -> Result<(f64, f64, bool)> {
+    let path = capture_screen()?;
+    let bytes = std::fs::read(&path)?;
+    let _ = std::fs::remove_file(&path);
+    let b64 = B64.encode(&bytes);
+    tracing::info!("vision: locating {:?} ({} KB)", description, bytes.len() / 1024);
+
+    let prompt = format!(
+        "Look at this screenshot of a Mac screen. Locate: {description}.\n\
+         Respond with ONLY a compact JSON object, nothing else, giving the CENTER \
+         of that element as FRACTIONS of the image (origin top-left, each 0.0-1.0):\n\
+         {{\"found\": true, \"x\": 0.42, \"y\": 0.13}}\n\
+         If it is not visible, respond {{\"found\": false, \"x\": 0, \"y\": 0}}. \
+         No prose, no markdown, no code fences."
+    );
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(VISION_TIMEOUT_SECS))
+        .build()?;
+    let mut errors: Vec<String> = Vec::new();
+    let mut raw: Option<String> = None;
+
+    if let Some(key) = env_nonempty("GEMINI_API_KEY") {
+        let model = env_nonempty("GEMINI_VISION_MODEL").unwrap_or_else(|| GEMINI_DEFAULT_MODEL.into());
+        match gemini_vision(&client, &key, &model, &prompt, &b64) {
+            Ok(d) => raw = Some(d),
+            Err(e) => record(&mut errors, "gemini", &model, &e),
+        }
+    }
+    if raw.is_none() {
+        if let Some(key) = env_nonempty("OPENAI_API_KEY") {
+            let base = env_nonempty("OPENAI_BASE_URL").unwrap_or_else(|| OPENAI_DEFAULT_BASE_URL.into());
+            let model = env_nonempty("OPENAI_VISION_MODEL").unwrap_or_else(|| OPENAI_DEFAULT_VISION_MODEL.into());
+            match openai_vision(&client, base.trim_end_matches('/'), &key, &model, &prompt, &b64) {
+                Ok(d) => raw = Some(d),
+                Err(e) => record(&mut errors, "openai", &model, &e),
+            }
+        }
+    }
+    if raw.is_none() {
+        if let Some(model) = env_nonempty("OLLAMA_VISION_MODEL") {
+            let base = env_nonempty("OLLAMA_BASE_URL").unwrap_or_else(|| OLLAMA_DEFAULT_BASE_URL.into());
+            match ollama_vision(&client, base.trim_end_matches('/'), &model, &prompt, &b64) {
+                Ok(d) => raw = Some(d),
+                Err(e) => record(&mut errors, "ollama", &model, &e),
+            }
+        }
+    }
+
+    let raw = raw.ok_or_else(|| {
+        if errors.is_empty() {
+            anyhow!("vision locate: no vision provider configured")
+        } else {
+            anyhow!("vision locate: all providers failed — {}", errors.join("  |  "))
+        }
+    })?;
+    tracing::info!("vision: locate {:?} raw ← {}", description, truncate(&raw, 200));
+
+    let parsed = parse_locate_json(&raw)
+        .map(|(x, y, found)| (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0), found))
+        .ok_or_else(|| anyhow!("vision locate: couldn't parse coordinates from: {}", truncate(&raw, 160)))?;
+    tracing::info!(
+        "vision: locate {:?} → x_frac={:.3} y_frac={:.3} found={}",
+        description, parsed.0, parsed.1, parsed.2
+    );
+    Ok(parsed)
+}
+
+/// Tolerantly pull `{found,x,y}` out of the model's reply (it may wrap it).
+fn parse_locate_json(s: &str) -> Option<(f64, f64, bool)> {
+    let start = s.find('{')?;
+    let end = s.rfind('}')?;
+    if end < start {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(&s[start..=end]).ok()?;
+    let x = v.get("x").and_then(|n| n.as_f64())?;
+    let y = v.get("y").and_then(|n| n.as_f64())?;
+    let found = v.get("found").and_then(|b| b.as_bool()).unwrap_or(true);
+    Some((x, y, found))
+}
+
 fn record(errors: &mut Vec<String>, provider: &str, model: &str, e: &anyhow::Error) {
     tracing::warn!("vision[{provider}/{model}]: {e}");
     errors.push(format!("{provider}: {}", truncate(&e.to_string(), 120)));

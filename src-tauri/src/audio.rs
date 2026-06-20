@@ -105,6 +105,9 @@ struct BargeInDetector {
 
 impl BargeInDetector {
     /// Called when Jarvis starts speaking. Resets all state.
+    /// (Currently unused — automatic acoustic barge-in is disabled until we
+    /// ship real AEC; see the note in state.rs. Kept for that revival.)
+    #[allow(dead_code)]
     fn start(&mut self) {
         self.started_at        = Some(std::time::Instant::now());
         self.baseline_sum      = 0.0;
@@ -466,6 +469,8 @@ impl AudioPipe {
     }
 
     /// Arm the barge-in detector. Call when Jarvis starts speaking.
+    /// (Currently unused — auto barge-in disabled until AEC; see state.rs.)
+    #[allow(dead_code)]
     pub fn start_speaking_mode(&self) {
         self.inner.barge_in.lock().start();
         self.inner.is_speaking_mode.store(true, Ordering::Release);
@@ -487,20 +492,6 @@ fn rms_f32(data: &[f32]) -> f32 {
     if data.is_empty() { return 0.0; }
     let sum: f32 = data.iter().map(|x| x * x).sum();
     (sum / data.len() as f32).sqrt()
-}
-
-fn rms_i16(data: &[i16]) -> f32 {
-    if data.is_empty() { return 0.0; }
-    let sum: f64 = data.iter().map(|&x| { let f = x as f64 / i16::MAX as f64; f * f }).sum();
-    (sum / data.len() as f64).sqrt() as f32
-}
-
-fn rms_u16(data: &[u16]) -> f32 {
-    if data.is_empty() { return 0.0; }
-    let sum: f64 = data.iter().map(|&x| {
-        let f = (x as f64 - 32768.0) / 32768.0; f * f
-    }).sum();
-    (sum / data.len() as f64).sqrt() as f32
 }
 
 pub fn write_wav(result: &RecordingResult, path: &std::path::Path) -> Result<()> {

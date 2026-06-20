@@ -31,12 +31,11 @@ impl Provider {
             .build().ok()?;
         Some(Self { api_key, model, client })
     }
-
-    pub fn model(&self) -> &str { &self.model }
 }
 
 impl LlmProvider for Provider {
     fn name(&self) -> &'static str { "gemini" }
+    fn model(&self) -> &str { &self.model }
 
     fn generate(&self, history: &[Message], tools_reg: &[tools::Tool]) -> Result<String> {
         // Build native Gemini contents from normalized history
@@ -86,6 +85,12 @@ impl LlmProvider for Provider {
                 else if let Some(fc) = &p.function_call { function_calls.push(fc.clone()); }
             }
 
+            // Log the model's own text (reasoning / plan) for this round so we
+            // can see WHY it chose the tools it did — not just which.
+            if !model_text.trim().is_empty() {
+                tracing::info!("gemini[round {round}]: assistant ← {}", truncate(&model_text, 600));
+            }
+
             if function_calls.is_empty() {
                 return Ok(model_text);
             }
@@ -97,7 +102,7 @@ impl LlmProvider for Provider {
             }));
             for fc in function_calls {
                 tracing::info!("gemini: tool call → {}({})", fc.name, fc.args);
-                let result = run_tool(tools_reg, &fc.name, &fc.args);
+                let result = crate::tools::dispatch(tools_reg, &fc.name, &fc.args);
                 tracing::info!("gemini: tool result ← {result}");
                 contents.push(json!({
                     "role": "user",
@@ -107,16 +112,6 @@ impl LlmProvider for Provider {
             tracing::debug!("gemini: round {round} → tool loop");
         }
         bail!("gemini: exceeded MAX_TOOL_ROUNDS")
-    }
-}
-
-fn run_tool(tools_reg: &[tools::Tool], name: &str, args: &Value) -> Value {
-    let Some(t) = tools_reg.iter().find(|t| t.name == name) else {
-        return json!({ "error": format!("unknown tool: {name}") });
-    };
-    match (t.handler)(args) {
-        Ok(v)  => v,
-        Err(e) => json!({ "error": e.to_string() }),
     }
 }
 

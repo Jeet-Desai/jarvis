@@ -1,0 +1,247 @@
+/*
+ * Shared styles for the autonomous-control UI: the confirmation prompt and
+ * the activity feed. Designed to match the Iron-Man HUD aesthetic in hud.css
+ * (cyan accents, monospace letter-spaced labels, glassy dark translucent
+ * cards with thin borders and subtle glow). Uses the --jarvis-* vars from
+ * global.css.
+ */
+
+/* danger accent helper: rows/badges set --danger then reuse it */
+.jv-danger-read_only   { --danger: var(--jarvis-cyan); }
+.jv-danger-mutating    { --danger: var(--jarvis-amber); }
+.jv-danger-destructive { --danger: var(--jarvis-red); }
+
+/* ────────── confirmation prompt (HUD overlay form) ────────── */
+.jv-confirm-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+  pointer-events: none; /* overlay backdrop ignores clicks; the card opts in */
+  background: radial-gradient(ellipse at center, rgba(2, 8, 14, 0.35) 0%, rgba(2, 8, 14, 0.62) 100%);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+  animation: jv-fade-in 140ms ease-out;
+}
+
+.jv-confirm-card {
+  pointer-events: auto;
+  width: min(460px, 86vw);
+  background: rgba(8, 22, 34, 0.78);
+  border: 1px solid var(--danger, var(--jarvis-cyan));
+  border-radius: 6px;
+  padding: 20px 22px 18px;
+  font-family: "SF Mono", "JetBrains Mono", "Menlo", monospace;
+  box-shadow:
+    0 0 0 1px rgba(2, 8, 14, 0.6),
+    0 0 40px color-mix(in srgb, var(--danger, var(--jarvis-cyan)) 28%, transparent),
+    inset 0 0 28px rgba(65, 227, 255, 0.06);
+  animation: jv-rise 160ms ease-out;
+}
+
+.jv-confirm-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.jv-confirm-title {
+  font-size: 10px;
+  letter-spacing: 4px;
+  color: rgba(229, 246, 255, 0.55);
+  text-transform: uppercase;
+}
+
+.jv-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 9px;
+  letter-spacing: 2.5px;
+  text-transform: uppercase;
+  padding: 4px 9px;
+  border-radius: 2px;
+  color: var(--danger, var(--jarvis-cyan));
+  border: 1px solid color-mix(in srgb, var(--danger, var(--jarvis-cyan)) 55%, transparent);
+  background: color-mix(in srgb, var(--danger, var(--jarvis-cyan)) 10%, transparent);
+  text-shadow: 0 0 8px color-mix(in srgb, var(--danger, var(--jarvis-cyan)) 70%, transparent);
+}
+.jv-badge-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--danger, var(--jarvis-cyan));
+  box-shadow: 0 0 6px var(--danger, var(--jarvis-cyan));
+}
+
+.jv-confirm-summary {
+  font-size: 14px;
+  line-height: 1.55;
+  color: #e5f6ff;
+  margin: 4px 0 18px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.jv-confirm-actions {
+  display: flex;
+  gap: 12px;
+}
+.jv-btn {
+  flex: 1;
+  font-family: inherit;
+  font-size: 11px;
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  padding: 10px 12px;
+  border-radius: 3px;
+  cursor: pointer;
+  background: transparent;
+  transition: box-shadow 120ms ease, border-color 120ms ease, background 120ms ease;
+}
+.jv-btn-approve {
+  border: 1px solid color-mix(in srgb, #4dff9e 55%, transparent);
+  color: #b6ffd5;
+}
+.jv-btn-approve:hover {
+  border-color: #4dff9e;
+  background: rgba(77, 255, 158, 0.08);
+  box-shadow: 0 0 16px rgba(77, 255, 158, 0.35);
+}
+.jv-btn-deny {
+  border: 1px solid color-mix(in srgb, var(--jarvis-red) 55%, transparent);
+  color: #ffc1c1;
+}
+.jv-btn-deny:hover {
+  border-color: var(--jarvis-red);
+  background: rgba(255, 80, 80, 0.08);
+  box-shadow: 0 0 16px rgba(255, 80, 80, 0.35);
+}
+
+.jv-confirm-hint {
+  margin-top: 12px;
+  text-align: center;
+  font-size: 9px;
+  letter-spacing: 2px;
+  color: rgba(229, 246, 255, 0.4);
+}
+.jv-confirm-hint kbd {
+  font-family: inherit;
+  color: var(--jarvis-cyan);
+  opacity: 0.85;
+}
+
+/* ────────── compact confirm (orb window) ────────── */
+.jv-confirm-orb {
+  pointer-events: none; /* orb window is click-through anyway */
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 34px;
+  display: flex;
+  justify-content: center;
+  z-index: 20;
+  animation: jv-fade-in 140ms ease-out;
+}
+.jv-confirm-orb-card {
+  max-width: 92vw;
+  text-align: center;
+  background: rgba(6, 16, 26, 0.82);
+  border: 1px solid var(--danger, var(--jarvis-cyan));
+  border-radius: 6px;
+  padding: 10px 14px;
+  font-family: "SF Mono", "JetBrains Mono", "Menlo", monospace;
+  box-shadow: 0 0 26px color-mix(in srgb, var(--danger, var(--jarvis-cyan)) 30%, transparent);
+}
+.jv-confirm-orb-badge {
+  font-size: 8px;
+  letter-spacing: 2.5px;
+  text-transform: uppercase;
+  color: var(--danger, var(--jarvis-cyan));
+  text-shadow: 0 0 8px color-mix(in srgb, var(--danger, var(--jarvis-cyan)) 70%, transparent);
+  margin-bottom: 5px;
+}
+.jv-confirm-orb-summary {
+  font-size: 12px;
+  line-height: 1.4;
+  color: #e5f6ff;
+  margin-bottom: 8px;
+  word-break: break-word;
+}
+.jv-confirm-orb-hint {
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  color: rgba(229, 246, 255, 0.55);
+}
+.jv-confirm-orb-hint kbd {
+  font-family: inherit;
+  color: var(--jarvis-cyan);
+}
+
+/* ────────── activity feed ────────── */
+.jv-activity {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.jv-activity-empty {
+  font-size: 9px;
+  letter-spacing: 2px;
+  font-style: italic;
+  color: rgba(229, 246, 255, 0.28);
+}
+.jv-activity-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  line-height: 1.3;
+  padding: 4px 8px;
+  border-radius: 3px;
+  background: rgba(8, 22, 34, 0.45);
+  border: 1px solid rgba(65, 227, 255, 0.12);
+  animation: jv-fade-in 160ms ease-out;
+}
+.jv-activity-glyph {
+  flex: none;
+  width: 14px;
+  text-align: center;
+  font-size: 11px;
+}
+.jv-glyph-awaiting { color: var(--jarvis-amber); }
+.jv-glyph-running  { color: var(--jarvis-cyan); animation: jv-pulse 1.1s ease-in-out infinite; }
+.jv-glyph-ok       { color: #4dff9e; }
+.jv-glyph-error    { color: var(--jarvis-red); }
+.jv-glyph-denied   { color: rgba(229, 246, 255, 0.4); }
+
+.jv-activity-summary {
+  flex: 1;
+  min-width: 0;
+  color: #cfeeff;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.jv-activity-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--danger, var(--jarvis-cyan));
+  box-shadow: 0 0 5px var(--danger, var(--jarvis-cyan));
+}
+
+@keyframes jv-pulse {
+  0%, 100% { opacity: 0.4; }
+  50%      { opacity: 1; }
+}
+@keyframes jv-fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes jv-rise {
+  from { opacity: 0; transform: translateY(8px) scale(0.98); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}

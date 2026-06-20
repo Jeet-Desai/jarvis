@@ -98,8 +98,26 @@
   gap: 12px;
   align-items: baseline;
 }
-.hud-sysrow span { opacity: 0.5; min-width: 28px; }
+.hud-sysrow span { opacity: 0.5; min-width: 34px; }
 .hud-sysrow b { color: #b6f3ff; font-weight: 500; }
+.hud-mode[data-mode="safe"]    { color: #4dff9e; }
+.hud-mode[data-mode="trusted"] { color: var(--jarvis-amber); }
+.hud-mode[data-mode="dev"]     { color: var(--jarvis-red); }
+
+/* ────────── activity feed panel (left, below sysinfo) ────────── */
+.hud-activity-panel {
+  position: absolute;
+  top: 150px;
+  left: 80px;
+  width: 260px;
+  max-height: 46vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: auto;
+}
+.hud-activity-panel::-webkit-scrollbar { width: 0; }
 
 /* ────────── center orb ────────── */
 .hud-orb-wrap {

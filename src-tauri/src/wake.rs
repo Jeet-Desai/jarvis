@@ -41,6 +41,7 @@ pub fn start_watcher(app: AppHandle, app_state: Arc<AppState>) {
         .spawn(move || {
             tracing::info!("wake: watcher started — listening for 'jarvis' phrases");
             let mut last_action = Instant::now() - Duration::from_secs(60);
+            let mut consecutive_errs: u32 = 0;
 
             loop {
                 std::thread::sleep(Duration::from_millis(STEP_MS));
@@ -72,9 +73,19 @@ pub fn start_watcher(app: AppHandle, app_state: Arc<AppState>) {
                 }
 
                 let text = match stt::transcribe(&snapshot, pipe.sample_rate, pipe.channels) {
-                    Ok(t) => t,
+                    Ok(t) => {
+                        consecutive_errs = 0;
+                        t
+                    }
                     Err(e) => {
-                        tracing::debug!("wake: stt error: {e}");
+                        consecutive_errs = consecutive_errs.saturating_add(1);
+                        if consecutive_errs <= 3 || consecutive_errs % 10 == 0 {
+                            tracing::warn!("wake: stt error (#{consecutive_errs}): {e}");
+                        }
+                        // Back off so a persistent failure doesn't re-run STT
+                        // every STEP_MS and peg the CPU.
+                        let backoff = (consecutive_errs.min(10) as u64) * 300;
+                        std::thread::sleep(Duration::from_millis(backoff));
                         continue;
                     }
                 };

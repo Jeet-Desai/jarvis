@@ -1,6 +1,8 @@
 import { onMount, createSignal, onCleanup } from "solid-js";
-import { state, transcript, response, level, initStateBridge } from "../shared/state";
+import { state, transcript, response, level, policyMode, initStateBridge } from "../shared/state";
 import { OrbScene } from "../shared/OrbScene";
+import { ConfirmationPrompt } from "../shared/ConfirmationPrompt";
+import { ActivityFeed } from "../shared/ActivityFeed";
 import "./hud.css";
 
 export function Hud() {
@@ -34,11 +36,20 @@ export function Hud() {
         <div class="hud-clock-date">{formatDate()}</div>
       </div>
 
-      {/* Top-left system status placeholder */}
+      {/* Top-left system status */}
       <div class="hud-sysinfo">
         <div class="hud-sysrow"><span>SYS</span><b>ONLINE</b></div>
         <div class="hud-sysrow"><span>MIC</span><b>READY</b></div>
-        <div class="hud-sysrow"><span>NET</span><b>UP</b></div>
+        <div class="hud-sysrow">
+          <span>MODE</span>
+          <b class="hud-mode" data-mode={policyMode()}>{(policyMode() || "—").toUpperCase()}</b>
+        </div>
+      </div>
+
+      {/* Left activity feed — live autonomous-control actions */}
+      <div class="hud-activity-panel">
+        <div class="hud-panel-label">ACTIVITY</div>
+        <ActivityFeed limit={8} />
       </div>
 
       {/* Large center orb */}
@@ -64,6 +75,9 @@ export function Hud() {
           <div class="hud-panel-text">{response() || <span class="hud-placeholder">— standing by —</span>}</div>
         </div>
       </div>
+
+      {/* Confirmation overlay — sits above everything */}
+      <ConfirmationPrompt variant="hud" />
     </div>
   );
 }

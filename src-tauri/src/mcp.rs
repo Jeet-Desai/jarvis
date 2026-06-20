@@ -102,15 +102,25 @@ impl McpManager {
         let args_map = args.as_object().cloned();
         let tool_name = tool_name.to_string();
 
+        // Bound every MCP call so a slow/dead server subprocess can't make the
+        // user wait the full brain timeout (and the same protects future MCP
+        // servers like the Playwright browser one).
         let result = self.runtime.block_on(async move {
-            peer.call_tool(CallToolRequestParam {
-                name: tool_name.into(),
-                arguments: args_map,
-            })
+            tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                peer.call_tool(CallToolRequestParam {
+                    name: tool_name.into(),
+                    arguments: args_map,
+                }),
+            )
             .await
-        })?;
+        });
 
-        Ok(extract_text_content(&result))
+        match result {
+            Ok(Ok(r)) => Ok(extract_text_content(&r)),
+            Ok(Err(e)) => Err(e.into()),
+            Err(_) => bail!("MCP call timed out after 15s — the server may be slow or stuck"),
+        }
     }
 }
 

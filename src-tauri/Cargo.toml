@@ -45,10 +45,25 @@ base64 = "0.22"
 # over stdio. Optional at runtime — only spawns if user configures credentials.
 # (tokio already declared above with "full" features — covers what rmcp needs.)
 rmcp = { version = "0.8", features = ["client", "transport-child-process"] }
+# enigo: cross-platform synthetic mouse/keyboard input (macOS CGEvent, Windows
+# SendInput, Linux X11). The single anchor that makes JARVIS 2.0's computer
+# control portable. On macOS it posts CGEvents — needs the Accessibility TCC
+# grant, the same bucket permissions.rs already requests via AXIsProcessTrusted.
+enigo = "0.6"
+# toml: parse the human-editable safety policy (policy.toml). Tiny, pure Rust.
+toml = "0.8"
 
 [target."cfg(target_os = \"macos\")".dependencies]
 cocoa = "0.26"
 objc = "0.2"
+# Accessibility (AXUIElement) FFI for reading the focused app's UI tree —
+# roles, labels, on-screen coordinates — so Jarvis can understand and click
+# native UI. We hand-declare the few AX functions we need (matching the FFI
+# style already in permissions.rs) and use core-foundation for safe
+# CFString/CFArray RAII + the Create-rule CFRelease discipline. Same
+# Accessibility TCC grant as enigo, already requested at startup.
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
 # NSPanel conversion for reliable fullscreen overlay (the cocoa NSWindow
 # approach with level 1000 + fullScreenAuxiliary works for most fullscreen
 # apps but is unreliable on Sonoma/Sequoia/Tahoe with browser/video full-

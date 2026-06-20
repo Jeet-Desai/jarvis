@@ -8,15 +8,20 @@
 
 use anyhow::Result;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::brain;
+use crate::control;
+use crate::policy::{self, DangerLevel, Decision};
 
-/// One callable tool: Gemini sees the `declaration`, and when it issues a
-/// `functionCall` with this name we run `handler` and feed the result back.
+/// One callable tool: the LLM sees the `declaration`, and when it issues a tool
+/// call with this name we run `handler` (through `dispatch`, which enforces the
+/// safety policy) and feed the result back. `danger` drives that policy gate.
 pub struct Tool {
     pub name: &'static str,
     pub declaration: Value,
     pub handler: fn(&Value) -> Result<Value>,
+    pub danger: DangerLevel,
 }
 
 /// Returns every tool Jarvis has. Order doesn't matter.
@@ -29,6 +34,7 @@ pub fn registry() -> Vec<Tool> {
                 "description": "Return the ground-truth identity of the LLM provider(s) and model(s) currently running this assistant. Use whenever the user asks 'what model are you', 'which LLM', 'which provider', 'are you GPT / Gemini / Claude / Ollama', 'what brain am I talking to'. Returns the configured fallback order with concrete model names — the first entry is what's serving this turn unless a fallback was triggered. Do NOT guess model identity from training data; always call this tool.",
                 "parameters": { "type": "object", "properties": {} }
             }),
+            danger: DangerLevel::ReadOnly,
             handler: get_brain_info,
         },
         Tool {
@@ -42,6 +48,7 @@ pub fn registry() -> Vec<Tool> {
                     "required": []
                 }
             }),
+            danger: DangerLevel::ReadOnly,
             handler: get_current_time,
         },
         Tool {
@@ -51,6 +58,7 @@ pub fn registry() -> Vec<Tool> {
                 "description": "Get the name of the macOS app the user currently has in focus. Use before answering questions that depend on what the user is currently working with (e.g. \"what am I doing right now?\" or to choose which app to read context from).",
                 "parameters": { "type": "object", "properties": {}, "required": [] }
             }),
+            danger: DangerLevel::ReadOnly,
             handler: get_focused_app,
         },
         Tool {
@@ -60,6 +68,7 @@ pub fn registry() -> Vec<Tool> {
                 "description": "Read the user's currently active browser tab — returns URL, page title, and the first ~4000 chars of visible page text. Call this whenever the user asks about a webpage they're viewing, references 'this page' / 'this article' / 'what I'm reading' / 'this site', wants a summary, wants you to answer something based on what's on screen, or any context-dependent question about web content. Supports Chrome, Safari, Arc, Brave, Edge, Vivaldi. Returns an error for Firefox or when no browser is focused.",
                 "parameters": { "type": "object", "properties": {}, "required": [] }
             }),
+            danger: DangerLevel::ReadOnly,
             handler: get_browser_context,
         },
         Tool {
@@ -69,6 +78,7 @@ pub fn registry() -> Vec<Tool> {
                 "description": "Read whatever text is currently on the user's macOS clipboard. THIS IS THE PRIMARY WAY to read text from non-browser apps (WhatsApp, Slack, Discord, VS Code, Mail, Notes, Messages, terminal, anywhere). Workflow: tell the user 'select the text with Cmd+A and copy with Cmd+C, then I'll read it' — they do it — then YOU call this tool. Returns the clipboard contents (up to ~4000 chars). Requires NO permission — works on every Mac immediately.",
                 "parameters": { "type": "object", "properties": {}, "required": [] }
             }),
+            danger: DangerLevel::ReadOnly,
             handler: get_clipboard,
         },
         Tool {
@@ -84,6 +94,7 @@ pub fn registry() -> Vec<Tool> {
                     "required": ["query"]
                 }
             }),
+            danger: DangerLevel::ReadOnly,
             handler: see_screen,
         },
         Tool {
@@ -101,6 +112,7 @@ pub fn registry() -> Vec<Tool> {
                     "required": ["timeMin", "timeMax"]
                 }
             }),
+            danger: DangerLevel::ReadOnly,
             handler: list_calendar_events,
         },
         Tool {
@@ -121,6 +133,7 @@ pub fn registry() -> Vec<Tool> {
                     "required": ["summary", "start", "end"]
                 }
             }),
+            danger: DangerLevel::Mutating,
             handler: create_calendar_event,
         },
         Tool {
@@ -138,6 +151,7 @@ pub fn registry() -> Vec<Tool> {
                     "required": ["text"]
                 }
             }),
+            danger: DangerLevel::Mutating,
             handler: type_text,
         },
         Tool {
@@ -153,6 +167,7 @@ pub fn registry() -> Vec<Tool> {
                     "required": ["text"]
                 }
             }),
+            danger: DangerLevel::Mutating,
             handler: set_clipboard,
         },
         Tool {
@@ -168,6 +183,7 @@ pub fn registry() -> Vec<Tool> {
                     "required": ["app_name"]
                 }
             }),
+            danger: DangerLevel::Mutating,
             handler: focus_app,
         },
         Tool {
@@ -184,9 +200,233 @@ pub fn registry() -> Vec<Tool> {
                     "required": ["key"]
                 }
             }),
+            danger: DangerLevel::Mutating,
             handler: send_shortcut,
         },
-        // Future: read_screen_via_accessibility, click_at_xy, …
+        Tool {
+            name: "read_screen_elements",
+            declaration: json!({
+                "name": "read_screen_elements",
+                "description": "Read the interactive UI elements (buttons, text fields, links, menu items, checkboxes…) of the CURRENTLY FOCUSED app via macOS Accessibility, each with its on-screen label and center coordinates. Use this to 'understand the screen' before acting — e.g. to find the button or field to click. Returns up to ~120 elements. After reading, click one with `click_element` (by label) or `click` (by coordinates). Requires Accessibility permission (already granted to Jarvis).",
+                "parameters": { "type": "object", "properties": {}, "required": [] }
+            }),
+            danger: DangerLevel::ReadOnly,
+            handler: read_screen_elements,
+        },
+        Tool {
+            name: "locate_on_screen",
+            declaration: json!({
+                "name": "locate_on_screen",
+                "description": "Visually find WHERE something is on screen and get its click coordinates, by analyzing a screenshot with a vision model. Use this to click something that read_screen_elements / click_element can't find by label — an icon (the '+' new-tab button), a custom web button, a search result, a canvas/image element. Describe the target in plain words (e.g. 'the + new tab icon at the top of Chrome', 'the New meeting button', 'the first search result link'). Returns screen coordinates {x, y}; then call `click` with them. found=false means it isn't visible (scroll or rethink). Requires Screen Recording permission.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "description": { "type": "string", "description": "Plain-language description of the on-screen element to locate." }
+                    },
+                    "required": ["description"]
+                }
+            }),
+            danger: DangerLevel::ReadOnly,
+            handler: locate_on_screen,
+        },
+        Tool {
+            name: "click_element",
+            declaration: json!({
+                "name": "click_element",
+                "description": "Click an on-screen UI element of the focused app by its visible label (e.g. 'Send', 'New Chat', 'Submit', 'OK'). Finds the best-matching element from the accessibility tree and clicks its center. Optionally pass `role` (e.g. 'AXButton', 'AXLink', 'AXCheckBox') to disambiguate. Prefer this over raw `click` when you know the element's text — it's robust to layout changes. Call `read_screen_elements` first if unsure of the exact label.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "label": { "type": "string", "description": "Visible text/label of the element to click." },
+                        "role":  { "type": "string", "description": "Optional accessibility role filter, e.g. 'AXButton', 'AXLink', 'AXTextField'." }
+                    },
+                    "required": ["label"]
+                }
+            }),
+            danger: DangerLevel::Mutating,
+            handler: click_element,
+        },
+        Tool {
+            name: "click",
+            declaration: json!({
+                "name": "click",
+                "description": "Click the mouse at absolute screen coordinates (x, y). Use when you have coordinates from `read_screen_elements` (center_x/center_y) or `get_screen_info`, or for canvas/web/Electron UIs where element labels aren't available. Omit x/y to click at the current cursor position. Prefer `click_element` when you know the element's label.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "x": { "type": "integer", "description": "Absolute screen X (points). Omit to click at current cursor." },
+                        "y": { "type": "integer", "description": "Absolute screen Y (points). Omit to click at current cursor." },
+                        "button": { "type": "string", "description": "'left' (default), 'right', or 'middle'." },
+                        "double": { "type": "boolean", "description": "If true, double-click. Default false." }
+                    },
+                    "required": []
+                }
+            }),
+            danger: DangerLevel::Mutating,
+            handler: click,
+        },
+        Tool {
+            name: "move_mouse",
+            declaration: json!({
+                "name": "move_mouse",
+                "description": "Move the mouse cursor to absolute screen coordinates (x, y) without clicking. Useful to hover, or to position before a separate click/drag.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "x": { "type": "integer" },
+                        "y": { "type": "integer" }
+                    },
+                    "required": ["x", "y"]
+                }
+            }),
+            danger: DangerLevel::Mutating,
+            handler: move_mouse,
+        },
+        Tool {
+            name: "scroll",
+            declaration: json!({
+                "name": "scroll",
+                "description": "Scroll the focused window/area. Positive amount scrolls down (or right if horizontal); negative scrolls up/left. Amount is in scroll 'lines' (a few lines per call is typical).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "amount": { "type": "integer", "description": "Lines to scroll; positive=down/right, negative=up/left. Default 3." },
+                        "horizontal": { "type": "boolean", "description": "Scroll horizontally instead of vertically. Default false." }
+                    },
+                    "required": []
+                }
+            }),
+            danger: DangerLevel::Mutating,
+            handler: scroll,
+        },
+        Tool {
+            name: "get_screen_info",
+            declaration: json!({
+                "name": "get_screen_info",
+                "description": "Return the main display size (width/height in points) and the current mouse cursor position. Use to understand the coordinate space before moving/clicking.",
+                "parameters": { "type": "object", "properties": {}, "required": [] }
+            }),
+            danger: DangerLevel::ReadOnly,
+            handler: get_screen_info,
+        },
+        Tool {
+            name: "list_apps",
+            declaration: json!({
+                "name": "list_apps",
+                "description": "List the names of the apps currently running with a visible UI (foreground apps). Use to discover the exact app name before focus_app / quit_app, or to answer 'what apps are open'.",
+                "parameters": { "type": "object", "properties": {}, "required": [] }
+            }),
+            danger: DangerLevel::ReadOnly,
+            handler: list_apps,
+        },
+        Tool {
+            name: "quit_app",
+            declaration: json!({
+                "name": "quit_app",
+                "description": "Quit a running macOS app by name (graceful quit; apps may prompt to save). Use when the user says 'close X', 'quit Y'. Confirm with the user if the app may have unsaved work.",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "app_name": { "type": "string" } },
+                    "required": ["app_name"]
+                }
+            }),
+            danger: DangerLevel::Destructive,
+            handler: quit_app,
+        },
+        Tool {
+            name: "wait",
+            declaration: json!({
+                "name": "wait",
+                "description": "Pause briefly (milliseconds) to let the UI settle between actions — e.g. after focus_app or click before reading the screen or typing. Max 5000 ms.",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "ms": { "type": "integer", "description": "Milliseconds to wait (≤5000). Default 500." } },
+                    "required": []
+                }
+            }),
+            danger: DangerLevel::ReadOnly,
+            handler: wait_tool,
+        },
+        Tool {
+            name: "run_shell",
+            declaration: json!({
+                "name": "run_shell",
+                "description": "Run a shell command on the user's Mac and return its stdout/stderr/exit code. This is often the MOST RELIABLE way to do real work — manage files, run git, build/test code, query the system — instead of clicking through GUIs. Runs via `sh -c`. Times out (default 20s, max 120). DESTRUCTIVE: always gated by the safety policy and (outside dev mode) confirmed with the user. Do NOT use for interactive programs that need a TTY.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string", "description": "The shell command line to run." },
+                        "workdir": { "type": "string", "description": "Optional working directory (defaults to Jarvis's cwd)." },
+                        "timeout_secs": { "type": "integer", "description": "Optional timeout in seconds (1–120, default 20)." }
+                    },
+                    "required": ["command"]
+                }
+            }),
+            danger: DangerLevel::Destructive,
+            handler: run_shell,
+        },
+        Tool {
+            name: "read_file",
+            declaration: json!({
+                "name": "read_file",
+                "description": "Read a text file's contents (up to ~12k chars). Use to read code, configs, notes, logs. Pass an absolute path or one starting with ~/.",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"]
+                }
+            }),
+            danger: DangerLevel::ReadOnly,
+            handler: read_file,
+        },
+        Tool {
+            name: "write_file",
+            declaration: json!({
+                "name": "write_file",
+                "description": "Create or OVERWRITE a text file with the given content (creates parent folders). Use to write code, save notes, edit configs. DESTRUCTIVE: overwrites without merge; gated by the safety policy and confirmed outside dev mode. For surgical edits, read_file first then write the full new content.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path":    { "type": "string" },
+                        "content": { "type": "string", "description": "Full new file contents." }
+                    },
+                    "required": ["path", "content"]
+                }
+            }),
+            danger: DangerLevel::Destructive,
+            handler: write_file,
+        },
+        Tool {
+            name: "list_dir",
+            declaration: json!({
+                "name": "list_dir",
+                "description": "List the entries (files and folders) in a directory. Defaults to the home folder. Pass an absolute path or one starting with ~/.",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": []
+                }
+            }),
+            danger: DangerLevel::ReadOnly,
+            handler: list_dir,
+        },
+        Tool {
+            name: "search_files",
+            declaration: json!({
+                "name": "search_files",
+                "description": "Find files whose NAME contains a query string, under a directory (defaults to home). Returns up to 50 matching paths. Use to locate a file before reading or opening it.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Substring to match in file/folder names." },
+                        "dir":   { "type": "string", "description": "Optional root directory to search under (default: home)." }
+                    },
+                    "required": ["query"]
+                }
+            }),
+            danger: DangerLevel::ReadOnly,
+            handler: search_files,
+        },
     ]
 }
 
@@ -325,11 +565,22 @@ fn osascript(script: &str) -> Result<String> {
 /// Escaping keeps the value confined to the string literal; a hostile name
 /// at worst yields "app not found", never code execution.
 fn applescript_escape(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            // Drop any other control character (0x00–0x1F, 0x7F). These can't
+            // appear in a legitimate app name and would otherwise be a vector
+            // for breaking out of the AppleScript string literal.
+            c if (c as u32) < 0x20 || c as u32 == 0x7F => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -468,54 +719,10 @@ fn send_shortcut(args: &Value) -> Result<Value> {
         })
         .unwrap_or_default();
 
-    let mod_strs: Vec<&str> = modifiers
-        .iter()
-        .filter_map(|m| match m.as_str() {
-            "cmd" | "command" | "meta" | "super" => Some("command down"),
-            "shift" => Some("shift down"),
-            "option" | "opt" | "alt" => Some("option down"),
-            "control" | "ctrl" => Some("control down"),
-            _ => None,
-        })
-        .collect();
-    let using_clause = if mod_strs.is_empty() {
-        String::new()
-    } else {
-        format!(" using {{{}}}", mod_strs.join(", "))
-    };
-
-    let key_lc = key.to_lowercase();
-    let key_code: Option<u16> = match key_lc.as_str() {
-        "return" | "enter" => Some(36),
-        "escape" | "esc" => Some(53),
-        "space" => Some(49),
-        "tab" => Some(48),
-        "delete" | "backspace" => Some(51),
-        "forwarddelete" | "fwddelete" => Some(117),
-        "left" | "leftarrow" => Some(123),
-        "right" | "rightarrow" => Some(124),
-        "down" | "downarrow" => Some(125),
-        "up" | "uparrow" => Some(126),
-        "home" => Some(115),
-        "end" => Some(119),
-        "pageup" => Some(116),
-        "pagedown" => Some(121),
-        _ => None,
-    };
-
-    let script = if let Some(code) = key_code {
-        format!(r#"tell application "System Events" to key code {code}{using_clause}"#)
-    } else {
-        let escaped = applescript_escape(key);
-        format!(r#"tell application "System Events" to keystroke "{escaped}"{using_clause}"#)
-    };
-
-    osascript(&script)?;
-    Ok(json!({
-        "ok": true,
-        "key": key,
-        "modifiers": modifiers,
-    }))
+    // Native synthetic keystroke via enigo (cross-platform; more reliable than
+    // System Events `keystroke` and works in apps that ignore Apple Events).
+    control::press_keys(key, &modifiers)?;
+    Ok(json!({ "ok": true, "key": key, "modifiers": modifiers }))
 }
 
 fn set_clipboard(args: &Value) -> Result<Value> {
@@ -671,4 +878,438 @@ fn unix_to_ymdhms(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     let y = y + if m <= 2 { 1 } else { 0 };
     (y as i32, m, d, h, mi, s)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// JARVIS 2.0 computer-control tools — native input (enigo, cross-platform),
+// accessibility-grounded clicking (macOS AX), shell, and file operations. All
+// flow through `dispatch` below, so each is gated by the safety policy.
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn read_screen_elements(_args: &Value) -> Result<Value> {
+    let els = control::read_ui_elements(120)?;
+    Ok(json!({
+        "count": els.len(),
+        "elements": els,
+        "note": "Each element has role, label, and screen coordinates (center_x/center_y). Click one with click_element (by label) or click (by coordinates).",
+    }))
+}
+
+fn locate_on_screen(args: &Value) -> Result<Value> {
+    let desc = args
+        .get("description")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("missing required field: description"))?;
+    let (xf, yf, found) = crate::brain::vision::locate_on_screen(desc)?;
+    if !found {
+        return Ok(json!({
+            "found": false,
+            "note": "Not visible on screen — try scrolling, or use read_screen_elements to list elements."
+        }));
+    }
+    let (sw, sh) = control::screen_size().unwrap_or((0, 0));
+    if sw == 0 || sh == 0 {
+        return Ok(json!({ "error": "couldn't determine screen size to convert coordinates" }));
+    }
+    let x = (xf * sw as f64).round() as i32;
+    let y = (yf * sh as f64).round() as i32;
+    Ok(json!({
+        "found": true, "x": x, "y": y,
+        "note": format!("'{desc}' is at screen point ({x}, {y}). Click it with click(x={x}, y={y})."),
+    }))
+}
+
+fn click_element(args: &Value) -> Result<Value> {
+    let label = args
+        .get("label")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("missing required field: label"))?;
+    let role = args
+        .get("role")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
+    let el = control::click_ui_element(label, role)?;
+    Ok(json!({ "ok": true, "clicked": el }))
+}
+
+fn move_mouse(args: &Value) -> Result<Value> {
+    let x = int_arg(args, "x")?;
+    let y = int_arg(args, "y")?;
+    control::move_mouse(x, y)?;
+    Ok(json!({ "ok": true, "x": x, "y": y }))
+}
+
+fn click(args: &Value) -> Result<Value> {
+    let x = args.get("x").and_then(|v| v.as_i64()).map(|n| n as i32);
+    let y = args.get("y").and_then(|v| v.as_i64()).map(|n| n as i32);
+    let button = args.get("button").and_then(|v| v.as_str()).unwrap_or("left");
+    let double = args.get("double").and_then(|v| v.as_bool()).unwrap_or(false);
+    control::click(x, y, button, double)?;
+    Ok(json!({ "ok": true, "x": x, "y": y, "button": button, "double": double }))
+}
+
+fn scroll(args: &Value) -> Result<Value> {
+    let amount = args.get("amount").and_then(|v| v.as_i64()).unwrap_or(3) as i32;
+    let horizontal = args.get("horizontal").and_then(|v| v.as_bool()).unwrap_or(false);
+    control::scroll(amount, horizontal)?;
+    Ok(json!({ "ok": true, "amount": amount, "horizontal": horizontal }))
+}
+
+fn get_screen_info(_args: &Value) -> Result<Value> {
+    let (w, h) = control::screen_size().unwrap_or((0, 0));
+    let (cx, cy) = control::cursor_position().unwrap_or((0, 0));
+    Ok(json!({ "screen_width": w, "screen_height": h, "cursor_x": cx, "cursor_y": cy }))
+}
+
+fn wait_tool(args: &Value) -> Result<Value> {
+    let ms = args.get("ms").and_then(|v| v.as_u64()).unwrap_or(500).min(5000);
+    std::thread::sleep(std::time::Duration::from_millis(ms));
+    Ok(json!({ "ok": true, "waited_ms": ms }))
+}
+
+fn list_apps(_args: &Value) -> Result<Value> {
+    let out = osascript(
+        r#"tell application "System Events" to get name of every process whose background only is false"#,
+    )?;
+    let apps: Vec<String> = out
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    Ok(json!({ "apps": apps }))
+}
+
+fn quit_app(args: &Value) -> Result<Value> {
+    let app = args
+        .get("app_name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("missing required field: app_name"))?;
+    osascript(&format!(
+        r#"tell application "{}" to quit"#,
+        applescript_escape(app)
+    ))?;
+    Ok(json!({ "ok": true, "quit": app }))
+}
+
+fn read_file(args: &Value) -> Result<Value> {
+    let path = path_arg(args)?;
+    let meta = std::fs::metadata(&path).map_err(|e| anyhow::anyhow!("stat {path}: {e}"))?;
+    if meta.len() > 2_000_000 {
+        return Ok(json!({
+            "error": format!("{path} is {} bytes — too large to read inline. Use run_shell with head/grep/sed instead.", meta.len())
+        }));
+    }
+    let bytes = std::fs::read(&path).map_err(|e| anyhow::anyhow!("read {path}: {e}"))?;
+    let text = String::from_utf8_lossy(&bytes);
+    Ok(json!({ "path": path, "bytes": meta.len(), "content": cap_chars(&text, 12_000) }))
+}
+
+fn write_file(args: &Value) -> Result<Value> {
+    let path = path_arg(args)?;
+    let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&path, content).map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
+    Ok(json!({ "ok": true, "path": path, "bytes": content.len() }))
+}
+
+fn list_dir(args: &Value) -> Result<Value> {
+    let path = args
+        .get("path")
+        .and_then(|v| v.as_str())
+        .map(expand_tilde)
+        .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+    let mut entries = Vec::new();
+    for e in std::fs::read_dir(&path)
+        .map_err(|e| anyhow::anyhow!("read_dir {path}: {e}"))?
+        .flatten()
+    {
+        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        entries.push(json!({ "name": e.file_name().to_string_lossy(), "dir": is_dir }));
+        if entries.len() >= 200 {
+            break;
+        }
+    }
+    Ok(json!({ "path": path, "entries": entries }))
+}
+
+fn search_files(args: &Value) -> Result<Value> {
+    let query = args
+        .get("query")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("missing required field: query"))?
+        .to_lowercase();
+    let root = args
+        .get("dir")
+        .and_then(|v| v.as_str())
+        .map(expand_tilde)
+        .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+    let mut matches = Vec::new();
+    search_walk(std::path::Path::new(&root), &query, 0, &mut matches);
+    Ok(json!({ "query": query, "root": root, "matches": matches }))
+}
+
+fn search_walk(dir: &std::path::Path, query: &str, depth: usize, out: &mut Vec<String>) {
+    if depth > 6 || out.len() >= 50 {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        if out.len() >= 50 {
+            return;
+        }
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue; // skip dotfiles / hidden dirs
+        }
+        let p = e.path();
+        if name.to_lowercase().contains(query) {
+            out.push(p.to_string_lossy().to_string());
+        }
+        if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            search_walk(&p, query, depth + 1, out);
+        }
+    }
+}
+
+fn run_shell(args: &Value) -> Result<Value> {
+    let command = args
+        .get("command")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("missing required field: command"))?
+        .to_string();
+    let workdir = args.get("workdir").and_then(|v| v.as_str()).map(expand_tilde);
+    let timeout = args
+        .get("timeout_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(20)
+        .clamp(1, 120);
+
+    use std::process::Stdio;
+    let mut cmd = shell_command();
+    cmd.arg(&command).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if let Some(d) = &workdir {
+        cmd.current_dir(d);
+    }
+    let child = cmd.spawn().map_err(|e| anyhow::anyhow!("spawn: {e}"))?;
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(timeout)) {
+        Ok(Ok(out)) => Ok(json!({
+            "exit_code": out.status.code(),
+            "stdout": cap_chars(&String::from_utf8_lossy(&out.stdout), 10_000),
+            "stderr": cap_chars(&String::from_utf8_lossy(&out.stderr), 4_000),
+        })),
+        Ok(Err(e)) => Err(anyhow::anyhow!("run: {e}")),
+        Err(_) => {
+            kill_pid(pid);
+            Ok(json!({ "error": format!("command timed out after {timeout}s and was killed") }))
+        }
+    }
+}
+
+#[cfg(unix)]
+fn shell_command() -> std::process::Command {
+    let mut c = std::process::Command::new("sh");
+    c.arg("-c");
+    c
+}
+#[cfg(windows)]
+fn shell_command() -> std::process::Command {
+    let mut c = std::process::Command::new("cmd");
+    c.arg("/C");
+    c
+}
+
+#[cfg(unix)]
+fn kill_pid(pid: u32) {
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+}
+#[cfg(not(unix))]
+fn kill_pid(_pid: u32) {}
+
+// ── small arg / text helpers ────────────────────────────────────────────────
+
+fn int_arg(args: &Value, key: &str) -> Result<i32> {
+    args.get(key)
+        .and_then(|v| v.as_i64())
+        .map(|n| n as i32)
+        .ok_or_else(|| anyhow::anyhow!("missing/invalid integer field: {key}"))
+}
+
+fn path_arg(args: &Value) -> Result<String> {
+    args.get("path")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(expand_tilde)
+        .ok_or_else(|| anyhow::anyhow!("missing required field: path"))
+}
+
+fn expand_tilde(p: &str) -> String {
+    if let Some(rest) = p.strip_prefix("~/") {
+        if let Ok(h) = std::env::var("HOME") {
+            return format!("{h}/{rest}");
+        }
+    }
+    p.to_string()
+}
+
+fn cap_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let t: String = s.chars().take(max).collect();
+    format!("{t}…[truncated]")
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Dispatch — the single choke point every tool call flows through. Enforces the
+// safety policy, surfaces a confirmation when required, runs the handler, and
+// records the action in the activity feed + audit log. All three LLM providers
+// call this instead of invoking handlers directly.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// True once this turn has ingested untrusted content (web page / clipboard /
+/// screen / file). A subsequent mutation could be prompt-injection-driven, so
+/// the policy force-confirms it. Reset each turn by `begin_turn`.
+static TURN_TAINTED: AtomicBool = AtomicBool::new(false);
+
+/// Called at the start of every brain turn (from `brain::Brain::ask`).
+pub fn begin_turn() {
+    TURN_TAINTED.store(false, Ordering::Release);
+}
+
+pub fn turn_is_tainted() -> bool {
+    TURN_TAINTED.load(Ordering::Acquire)
+}
+
+fn is_untrusted_reader(name: &str) -> bool {
+    matches!(
+        name,
+        "get_browser_context"
+            | "get_clipboard"
+            | "see_screen"
+            | "read_screen_elements"
+            | "locate_on_screen"
+            | "read_file"
+    )
+}
+
+/// Run a tool by name with the safety policy applied. Returns a JSON value the
+/// provider feeds back to the model (errors are returned as `{ "error": … }`,
+/// never panics).
+pub fn dispatch(tools_reg: &[Tool], name: &str, args: &Value) -> Value {
+    let Some(tool) = tools_reg.iter().find(|t| t.name == name) else {
+        return json!({ "error": format!("unknown tool: {name}") });
+    };
+    let id = crate::gate::next_id();
+    let tainted = turn_is_tainted();
+    let pol = policy::global();
+    let summary = policy::describe(name, args);
+
+    match pol.decide(name, tool.danger, args, tainted) {
+        Decision::Deny { reason } => {
+            tracing::warn!("policy: DENY {name} — {reason}");
+            // Activity feed shows the canonical action summary (consistent with
+            // every other state); the raw reason goes to the audit log + the
+            // error result the brain relays to the user.
+            crate::gate::emit_activity(id, name, &summary, tool.danger, "denied");
+            audit_record(id, name, args, tool.danger, "denied", Some(&reason));
+            return json!({
+                "error": format!("Refused by the safety policy: {reason}. Tell the user why, and stop — do not retry.")
+            });
+        }
+        Decision::Confirm { summary: prompt, danger: prompt_danger } => {
+            tracing::info!("policy: CONFIRM {name} — {prompt}");
+            // Activity feed + audit use the canonical summary + tool.danger so a
+            // single action reads consistently across awaiting/running/ok states;
+            // the spoken/HUD PROMPT uses the decision's (possibly taint-annotated,
+            // possibly escalated) wording, which is the right UX for the ask.
+            crate::gate::emit_activity(id, name, &summary, tool.danger, "awaiting");
+            let approved =
+                crate::gate::request_confirmation(id, &prompt, prompt_danger, pol.confirm_timeout_secs);
+            if !approved {
+                crate::gate::emit_activity(id, name, &summary, tool.danger, "denied");
+                audit_record(id, name, args, tool.danger, "denied_by_user", None);
+                return json!({
+                    "error": "The user declined this action (or it timed out). Do NOT retry it; ask what they'd like instead."
+                });
+            }
+        }
+        Decision::Allow => {}
+    }
+
+    crate::gate::emit_activity(id, name, &summary, tool.danger, "running");
+    let result = match (tool.handler)(args) {
+        Ok(v) => v,
+        Err(e) => json!({ "error": e.to_string() }),
+    };
+    if is_untrusted_reader(name) {
+        TURN_TAINTED.store(true, Ordering::Release);
+    }
+    let status = if result.get("error").is_some() { "error" } else { "ok" };
+    crate::gate::emit_activity(id, name, &summary, tool.danger, status);
+    audit_record(id, name, args, tool.danger, status, None);
+    result
+}
+
+fn audit_record(id: u64, name: &str, args: &Value, danger: DangerLevel, status: &str, reason: Option<&str>) {
+    crate::gate::audit(json!({
+        "id": id,
+        "tool": name,
+        "danger": danger.as_str(),
+        "status": status,
+        "reason": reason,
+        "args": redact_args(args),
+        "ts": now_unix_secs(),
+    }));
+}
+
+/// Truncate long string args before they reach the audit log (so we don't dump
+/// pasted documents or secrets verbatim). Coarse but safe.
+fn redact_args(args: &Value) -> Value {
+    match args {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                let rv = match v {
+                    Value::String(s) if s.len() > 200 => {
+                        Value::String(format!("{}…[{}B]", &s[..safe_cut(s, 200)], s.len()))
+                    }
+                    other => other.clone(),
+                };
+                out.insert(k.clone(), rv);
+            }
+            Value::Object(out)
+        }
+        other => other.clone(),
+    }
+}
+
+fn safe_cut(s: &str, max: usize) -> usize {
+    let mut i = max.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }

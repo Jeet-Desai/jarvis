@@ -5,9 +5,12 @@ extern crate objc;
 
 mod audio;
 mod brain;
+mod control;
+mod gate;
 mod mcp;
 #[cfg(target_os = "macos")]
 mod permissions;
+mod policy;
 mod state;
 mod stt;
 mod tools;
@@ -73,6 +76,18 @@ fn toggle_close(app: AppHandle) {
 #[tauri::command]
 fn jarvis_stop(app: AppHandle, st: tauri::State<'_, Arc<AppState>>) {
     st.stop(&app);
+}
+
+/// Resolve a pending computer-control confirmation from the HUD buttons.
+#[tauri::command]
+fn jarvis_resolve_confirm(id: u64, approved: bool) {
+    gate::resolve(id, approved);
+}
+
+/// Expose the current safety-policy mode to the HUD (read-only).
+#[tauri::command]
+fn jarvis_policy_mode() -> String {
+    policy::global().mode.as_str().to_string()
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -302,6 +317,8 @@ pub fn run() {
     let pos_bl_sc    = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Digit4);
     // DEV: preview every state
     let preview_sc   = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyP);
+    // Approve a pending computer-control confirmation (deny = ⇧⌘S / HUD / timeout)
+    let confirm_yes_sc = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyY);
 
     let app_state_for_handler   = app_state.clone();
     let app_state_for_preview   = app_state.clone();
@@ -320,6 +337,7 @@ pub fn run() {
     let pos_br_sc_for_handler   = pos_br_sc.clone();
     let pos_bl_sc_for_handler   = pos_bl_sc.clone();
     let preview_sc_for_handler  = preview_sc.clone();
+    let confirm_yes_sc_for_handler = confirm_yes_sc.clone();
 
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init());
@@ -371,6 +389,10 @@ pub fn run() {
                     } else if shortcut == &preview_sc_for_handler {
                         tracing::info!("hotkey: Cmd+Shift+P — preview cycle (dev)");
                         app_state_for_preview.dev_cycle(app);
+                    } else if shortcut == &confirm_yes_sc_for_handler {
+                        if gate::resolve_latest(true) {
+                            tracing::info!("hotkey: Cmd+Shift+Y — approved pending action");
+                        }
                     }
                 })
                 .build(),
@@ -381,9 +403,22 @@ pub fn run() {
             jarvis_set,
             toggle_hud,
             toggle_close,
-            jarvis_stop
+            jarvis_stop,
+            jarvis_resolve_confirm,
+            jarvis_policy_mode
         ])
         .setup(move |app| {
+            // Make the app handle globally reachable so tool handlers can emit
+            // activity / confirmation events to the UI from any thread.
+            gate::set_app_handle(app.handle().clone());
+
+            // Load the configurable safety policy (writes a documented default
+            // policy.toml on first run) and open the append-only audit log.
+            policy::init(app.path().app_config_dir().ok());
+            if let Ok(data_dir) = app.path().app_data_dir() {
+                gate::init_audit(&data_dir);
+            }
+
             // Fire every TCC prompt that has a programmatic trigger so the
             // user grants permissions to Jarvis (not osascript / not a shell).
             // Runs on a background thread — UI shouldn't block on user dialogs.
@@ -462,6 +497,7 @@ pub fn run() {
             gs.register(pos_br_sc)?;
             gs.register(pos_bl_sc)?;
             gs.register(preview_sc)?;
+            gs.register(confirm_yes_sc)?;
 
             // Persist orb position whenever the user drags or hotkey-moves it.
             if let Some(orb) = app.get_webview_window("orb") {
@@ -497,6 +533,34 @@ pub fn run() {
             // Pre-warm the whisper model in the background so the first
             // transcription doesn't pay the ~1-2s model-load cost.
             stt::prewarm();
+
+            // Optional input-backend self-test (set JARVIS_SELFTEST_INPUT=1):
+            // exercises enigo from a BACKGROUND thread — exactly the path that
+            // crashed via Text-Input-Services-on-non-main-thread (SIGTRAP) before
+            // the main-thread fix. screen_size forces Enigo::new (builds the
+            // keymap → TSM) and key(Escape) drives the keyboard TSM path; both
+            // now marshal to the main thread. If this logs OK without aborting,
+            // the fix holds. Escape is benign; no text is typed anywhere.
+            #[cfg(target_os = "macos")]
+            if std::env::var("JARVIS_SELFTEST_INPUT").ok().as_deref() == Some("1") {
+                std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    tracing::info!("selftest: exercising input backend from a background thread…");
+                    match control::screen_size() {
+                        Ok((w, h)) => tracing::info!("selftest: screen_size OK = {w}x{h}"),
+                        Err(e) => tracing::error!("selftest: screen_size FAILED: {e}"),
+                    }
+                    match control::cursor_position() {
+                        Ok((x, y)) => tracing::info!("selftest: cursor_position OK = ({x},{y})"),
+                        Err(e) => tracing::error!("selftest: cursor_position FAILED: {e}"),
+                    }
+                    match control::press_keys("escape", &[]) {
+                        Ok(_) => tracing::info!("selftest: key(Escape) OK — keyboard TSM path ran on main"),
+                        Err(e) => tracing::error!("selftest: key(Escape) FAILED: {e}"),
+                    }
+                    tracing::info!("selftest: input backend did NOT crash — TSM main-thread fix verified");
+                });
+            }
 
             tracing::info!(
                 "Jarvis ready.  Hotkeys: \

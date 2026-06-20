@@ -23,6 +23,14 @@ pub enum JarvisState {
 pub struct AppState {
     pub state:        RwLock<JarvisState>,
     /// Normalized conversation history — works across any provider.
+    ///
+    /// LOCK CONTRACT: held for the ENTIRE brain turn (the `brain.ask` call in
+    /// `end_recording`), which can run up to ~30s of network + up to the policy
+    /// confirmation timeout (default 45s) if a tool needs approval. Therefore:
+    ///   • code running on the brain thread (providers, tool handlers, the gate)
+    ///     must NEVER re-acquire this lock — that self-deadlocks the turn;
+    ///   • other threads (hotkeys, audio callback) must use `try_lock`
+    ///     (see `reset_context`) so they never stall behind a turn.
     pub conversation: Mutex<Vec<Message>>,
     /// Always-on mic. Set during startup.
     pipe:       OnceLock<Arc<AudioPipe>>,
@@ -86,6 +94,7 @@ impl AppState {
         self.pipe.get().map(|a| a.as_ref())
     }
 
+    #[allow(dead_code)] // accessor kept for symmetry with pipe()/brain init
     pub fn brain(&self) -> Option<&Brain> {
         self.brain.get().map(|a| a.as_ref())
     }
@@ -295,6 +304,8 @@ impl AppState {
     pub fn stop(&self, app: &AppHandle) {
         let current = self.current();
         tracing::info!("stop: requested from {:?}", current);
+        // Deny any in-flight tool confirmation so the brain thread unblocks.
+        crate::gate::cancel_all();
         self.end_session();
         self.kill_current_speech();
         if let Some(pipe) = self.pipe.get() {
@@ -310,10 +321,26 @@ impl AppState {
     }
 
     pub fn reset_context(&self, app: &AppHandle) {
-        let n = self.conversation.lock().len();
-        self.conversation.lock().clear();
-        tracing::info!("brain: conversation reset ({n} entries dropped)");
-        let _ = app.emit("jarvis:response", "Memory cleared, sir.".to_string());
+        // Use try_lock: brain.ask() holds the conversation lock for the whole
+        // turn (up to ~30s + any confirmation). A blocking lock here would
+        // freeze the hotkey thread; instead defer the reset with a friendly
+        // note if a turn is mid-flight.
+        match self.conversation.try_lock() {
+            Some(mut conv) => {
+                let n = conv.len();
+                conv.clear();
+                drop(conv);
+                tracing::info!("brain: conversation reset ({n} entries dropped)");
+                let _ = app.emit("jarvis:response", "Memory cleared, sir.".to_string());
+            }
+            None => {
+                tracing::info!("brain: reset deferred — a turn is in progress");
+                let _ = app.emit(
+                    "jarvis:response",
+                    "I'm in the middle of something, sir — say stop first, then reset.".to_string(),
+                );
+            }
+        }
     }
 
     pub fn adjust_brightness(&self, app: &AppHandle, delta: f32) {
