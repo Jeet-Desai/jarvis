@@ -1,0 +1,12 @@
+[project]
+name = "jarvis-orchestrator"
+version = "0.1.0"
+description = "Jarvis dev-agent orchestrator — spawn & supervise Claude Code agents in isolated git worktrees, exposed to Jarvis over MCP/stdio."
+requires-python = ">=3.10"
+dependencies = [
+    "claude-agent-sdk>=0.2.0",
+    "mcp>=1.2.0",
+]
+
+[tool.uv]
+# pinned interpreter for reproducibility; uv fetches it if absent

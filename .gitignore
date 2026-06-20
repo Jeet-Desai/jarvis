@@ -31,3 +31,11 @@ models/
 *.swo
 *.code-workspace
 
+# Phase-0 throwaway spike (orchestrator feasibility test)
+spike/
+
+# Python orchestrator sidecar — track source, ignore env/caches
+orchestrator/.venv/
+__pycache__/
+*.pyc
+
