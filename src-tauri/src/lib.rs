@@ -161,6 +161,51 @@ fn normalize_agent_value(val: serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// Diff a freshly-polled agent roster against the previous statuses and return
+/// the spoken one-line updates to announce. Updates `prev` in place.
+///
+/// We announce ONLY meaningful, finished-work transitions of a LIVE agent:
+///   • working → idle  ("finished its turn")
+///   • anything → error ("ran into an error")
+/// We deliberately ignore spawning/working (just-started) transitions — the
+/// brain already gives a one-line confirmation when it spawns an agent.
+///
+/// The FIRST poll seeds `prev` SILENTLY (`seeded == false`): otherwise every
+/// agent restored from the persistence registry, or already running when the
+/// app launched, would announce itself on startup. Detached (live=false)
+/// agents never announce — their status is frozen history.
+fn diff_agent_updates(
+    prev: &mut std::collections::HashMap<String, String>,
+    agents: &serde_json::Value,
+    seeded: bool,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(arr) = agents.as_array() else { return out };
+    for a in arr {
+        let Some(id) = a.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let status = a.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        let name = a.get("name").and_then(|v| v.as_str()).unwrap_or("an agent");
+        let live = a.get("live").and_then(|v| v.as_bool()).unwrap_or(true);
+        let prev_status = prev.insert(id.to_string(), status.to_string());
+
+        if !seeded || !live {
+            continue;
+        }
+        let Some(ps) = prev_status.as_deref() else { continue };
+        if ps == status {
+            continue;
+        }
+        if ps == "working" && status == "idle" {
+            out.push(format!("Sir, the {name} agent finished its turn."));
+        } else if status == "error" && ps != "error" {
+            out.push(format!("Sir, the {name} agent ran into an error."));
+        }
+    }
+    out
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // HUD <-> orb mutual exclusivity
 // ──────────────────────────────────────────────────────────────────────────────
@@ -352,6 +397,76 @@ fn convert_to_panels(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> 
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// macOS GUI apps opened from Finder / the Dock / the Applications folder are
+/// started by `launchd`, which hands them a BARE environment — `PATH=/usr/bin`
+/// — and does NOT source the user's shell profile (`~/.zshrc` etc.). So
+/// user-installed CLIs vanish: `claude` (the subscription brain, in
+/// `~/.local/bin`) and `node`/`npx` (the calendar MCP, in `/opt/homebrew/bin`)
+/// become unreachable, silently breaking the brain and the MCP servers. A
+/// launch from a terminal only works because it inherits the shell's richer
+/// PATH. (This is why the same `.app` worked from a terminal but failed from
+/// the Dock with "Something went sideways" — `binary_on_path("claude")` was
+/// false, so the subscription brain dropped out.)
+///
+/// Fix (run ONCE at startup, before any provider/MCP/subprocess init): prepend
+/// the common user + Homebrew + toolchain install dirs that actually exist and
+/// aren't already on PATH. Same "fix the PATH on launch" step shipped by VS
+/// Code, GitHub Desktop, and friends — it makes the bundled `.app` behave the
+/// same however it was opened.
+///
+/// Safe to mutate the process env here: this is the first thing `run()` does,
+/// on the main thread, before any other thread is spawned.
+fn augment_path_for_gui_launch() {
+    let home = std::env::var("HOME").unwrap_or_default();
+    // User-local first (where `claude` installs), then Homebrew (Apple Silicon
+    // + Intel), then language toolchains.
+    let candidates = [
+        format!("{home}/.local/bin"),
+        "/opt/homebrew/bin".to_string(),
+        "/opt/homebrew/sbin".to_string(),
+        "/usr/local/bin".to_string(),
+        format!("{home}/.cargo/bin"),
+        format!("{home}/.bun/bin"),
+        format!("{home}/.deno/bin"),
+        format!("{home}/.volta/bin"),
+        format!("{home}/bin"),
+    ];
+    let existing = std::env::var("PATH").unwrap_or_default();
+    let (new_path, added) =
+        compute_path_augmentation(&existing, &candidates, |d| std::path::Path::new(d).is_dir());
+    if !added.is_empty() {
+        std::env::set_var("PATH", new_path);
+        tracing::info!(
+            "startup: augmented PATH for GUI launch (+{} dirs: {})",
+            added.len(),
+            added.join(", ")
+        );
+    }
+}
+
+/// Pure core of `augment_path_for_gui_launch`, factored out for testing:
+/// returns the new PATH and the dirs added (front-to-back). Prepends each
+/// candidate that `exists` and isn't already present, preserving candidate
+/// order at the front. `exists` is injected so tests need not touch the disk.
+fn compute_path_augmentation(
+    existing: &str,
+    candidates: &[String],
+    exists: impl Fn(&str) -> bool,
+) -> (String, Vec<String>) {
+    let mut entries: Vec<String> =
+        existing.split(':').filter(|s| !s.is_empty()).map(str::to_string).collect();
+    let mut added: Vec<String> = Vec::new();
+    // Prepend in reverse so the candidate order is preserved at the front.
+    for dir in candidates.iter().rev() {
+        if exists(dir) && !entries.iter().any(|e| e == dir) {
+            entries.insert(0, dir.clone());
+            added.push(dir.clone());
+        }
+    }
+    added.reverse(); // report front-to-back
+    (entries.join(":"), added)
+}
+
 pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -359,6 +474,10 @@ pub fn run() {
                 .unwrap_or_else(|_| "jarvis=info,tauri=warn".into()),
         )
         .init();
+
+    // Repair PATH for Finder/Dock launches BEFORE anything reads it (brain
+    // provider detection, MCP spawns). See the fn doc for the launchd caveat.
+    augment_path_for_gui_launch();
 
     // Load .env from project root (jarvis/.env). Silently ignored if absent.
     let _ = dotenvy::from_path(
@@ -574,16 +693,53 @@ pub fn run() {
                         // calls the sidecar directly (NOT through tools::dispatch),
                         // so it never enters the activity feed or takes the
                         // conversation lock.
+                        //
+                        // It ALSO drives PROACTIVE VOICE: it diffs each poll's
+                        // statuses and, when a dev agent finishes a turn or
+                        // errors, speaks a one-line update — but only while
+                        // Jarvis is fully at rest (`try_announce` gates on Idle /
+                        // no session / no pending confirm). Pending updates are
+                        // queued locally and drained one-per-poll, so a long
+                        // conversation just defers them, and speaking never
+                        // blocks the roster for more than one announcement.
                         let poll_mgr = manager.clone();
+                        let announce_state = app_state.clone();
+                        let announce_app = app.handle().clone();
                         std::thread::spawn(move || {
+                            use std::collections::{HashMap, VecDeque};
+                            // Cap the backlog so a user returning after many
+                            // finished turns hears a few recent updates, not a
+                            // long monologue; drop the oldest when full.
+                            const MAX_QUEUED: usize = 5;
+                            let mut prev: HashMap<String, String> = HashMap::new();
+                            let mut seeded = false;
+                            let mut queue: VecDeque<String> = VecDeque::new();
                             loop {
                                 std::thread::sleep(std::time::Duration::from_secs(2));
                                 if !poll_mgr.orchestrator_ready() {
                                     continue;
                                 }
                                 match poll_mgr.orchestrator_call("list_dev_agents", serde_json::json!({})) {
-                                    Ok(v) => gate::emit_agents(extract_agent_list(&v)),
+                                    Ok(v) => {
+                                        let agents = extract_agent_list(&v);
+                                        gate::emit_agents(agents.clone());
+                                        for msg in diff_agent_updates(&mut prev, &agents, seeded) {
+                                            queue.push_back(msg);
+                                            while queue.len() > MAX_QUEUED {
+                                                queue.pop_front();
+                                            }
+                                        }
+                                        seeded = true;
+                                    }
                                     Err(e) => tracing::debug!("mcp[orchestrator]: poll failed: {e}"),
+                                }
+                                // Drain at most ONE update per poll, and only if
+                                // Jarvis is at rest. If it isn't, the update stays
+                                // queued for a later, quieter moment.
+                                if let Some(msg) = queue.front().cloned() {
+                                    if announce_state.try_announce(&announce_app, &msg) {
+                                        queue.pop_front();
+                                    }
                                 }
                             }
                         });
@@ -685,4 +841,128 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod proactive_tests {
+    use super::diff_agent_updates;
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    fn agents(items: &[(&str, &str, &str, bool)]) -> serde_json::Value {
+        // (id, name, status, live)
+        serde_json::Value::Array(
+            items
+                .iter()
+                .map(|(id, name, status, live)| {
+                    json!({ "id": id, "name": name, "status": status, "live": live })
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn first_poll_seeds_silently() {
+        // The very first poll must NOT announce — otherwise every agent already
+        // running, or restored from the persistence registry, blurts on launch.
+        let mut prev = HashMap::new();
+        let now = agents(&[("a1", "site", "working", true), ("a2", "api", "idle", true)]);
+        let out = diff_agent_updates(&mut prev, &now, false);
+        assert!(out.is_empty(), "first (unseeded) poll spoke: {out:?}");
+        assert_eq!(prev.get("a1").map(String::as_str), Some("working"));
+        assert_eq!(prev.get("a2").map(String::as_str), Some("idle"));
+    }
+
+    #[test]
+    fn working_to_idle_announces_once() {
+        let mut prev = HashMap::new();
+        diff_agent_updates(&mut prev, &agents(&[("a1", "site", "working", true)]), false);
+        // Turn finishes → one update.
+        let out = diff_agent_updates(&mut prev, &agents(&[("a1", "site", "idle", true)]), true);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains("site") && out[0].contains("finished"), "{out:?}");
+        // Stable across the next identical poll — no repeat.
+        let again = diff_agent_updates(&mut prev, &agents(&[("a1", "site", "idle", true)]), true);
+        assert!(again.is_empty(), "repeated on an unchanged status: {again:?}");
+    }
+
+    #[test]
+    fn transition_into_error_announces() {
+        let mut prev = HashMap::new();
+        diff_agent_updates(&mut prev, &agents(&[("a1", "site", "working", true)]), false);
+        let out = diff_agent_updates(&mut prev, &agents(&[("a1", "site", "error", true)]), true);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains("error"), "{out:?}");
+    }
+
+    #[test]
+    fn just_started_transitions_are_silent() {
+        // spawning→working and idle→working (re-instructed) are NOT announced.
+        let mut prev = HashMap::new();
+        diff_agent_updates(&mut prev, &agents(&[("a1", "site", "spawning", true)]), false);
+        let a = diff_agent_updates(&mut prev, &agents(&[("a1", "site", "working", true)]), true);
+        assert!(a.is_empty(), "announced a start: {a:?}");
+        diff_agent_updates(&mut prev, &agents(&[("a1", "site", "idle", true)]), true);
+        let b = diff_agent_updates(&mut prev, &agents(&[("a1", "site", "working", true)]), true);
+        assert!(b.is_empty(), "announced a re-instruct: {b:?}");
+    }
+
+    #[test]
+    fn detached_agents_never_announce() {
+        // A live=false agent is frozen history (from the persistence registry);
+        // even a working→idle-looking change on it must stay silent.
+        let mut prev = HashMap::new();
+        diff_agent_updates(&mut prev, &agents(&[("a1", "site", "working", false)]), false);
+        let out = diff_agent_updates(&mut prev, &agents(&[("a1", "site", "idle", false)]), true);
+        assert!(out.is_empty(), "announced a detached agent: {out:?}");
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::compute_path_augmentation;
+
+    fn cands(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn finder_launch_prepends_existing_dirs_in_order() {
+        // The launchd / Finder case: a bare PATH, and the real install dirs get
+        // prepended in candidate order (so ~/.local/bin wins the `claude` lookup).
+        let candidates = cands(&["/u/.local/bin", "/opt/homebrew/bin", "/missing"]);
+        let (new_path, added) =
+            compute_path_augmentation("/usr/bin", &candidates, |d| d != "/missing");
+        assert_eq!(new_path, "/u/.local/bin:/opt/homebrew/bin:/usr/bin");
+        assert_eq!(added, vec!["/u/.local/bin", "/opt/homebrew/bin"]);
+    }
+
+    #[test]
+    fn terminal_launch_is_a_noop_when_already_present() {
+        // The terminal case: the dirs are already on PATH, so nothing changes.
+        let candidates = cands(&["/u/.local/bin", "/opt/homebrew/bin"]);
+        let existing = "/u/.local/bin:/opt/homebrew/bin:/usr/bin";
+        let (new_path, added) = compute_path_augmentation(existing, &candidates, |_| true);
+        assert_eq!(new_path, existing);
+        assert!(added.is_empty(), "should not re-add present dirs: {added:?}");
+    }
+
+    #[test]
+    fn missing_dirs_are_skipped() {
+        // Candidate dirs that don't exist on disk are never added.
+        let candidates = cands(&["/nope1", "/nope2"]);
+        let (new_path, added) = compute_path_augmentation("/usr/bin", &candidates, |_| false);
+        assert_eq!(new_path, "/usr/bin");
+        assert!(added.is_empty());
+    }
+
+    #[test]
+    fn partial_overlap_only_adds_the_missing_one() {
+        let candidates = cands(&["/u/.local/bin", "/opt/homebrew/bin"]);
+        // /opt/homebrew/bin already present; only ~/.local/bin should prepend.
+        let (new_path, added) =
+            compute_path_augmentation("/opt/homebrew/bin:/usr/bin", &candidates, |_| true);
+        assert_eq!(new_path, "/u/.local/bin:/opt/homebrew/bin:/usr/bin");
+        assert_eq!(added, vec!["/u/.local/bin"]);
+    }
 }

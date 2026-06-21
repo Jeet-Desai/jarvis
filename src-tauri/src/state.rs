@@ -278,6 +278,84 @@ impl AppState {
         });
     }
 
+    /// Speak an UNSOLICITED one-line update (e.g. "the website agent finished
+    /// its turn"), but ONLY if Jarvis is fully at rest. Returns true iff it
+    /// spoke. Designed to be called from the orchestrator poll thread.
+    ///
+    /// Contract / why it's careful:
+    ///   • A real user turn ALWAYS wins. We claim the Speaking slot with an
+    ///     atomic compare-and-set under the state write lock — if we aren't
+    ///     Idle, or a conversation session is active, or a tool confirmation is
+    ///     pending, we bail without speaking. Flipping Idle→Speaking under the
+    ///     same lock that `set()`/`toggle()` use means a concurrent wake word
+    ///     or hotkey can't slip a Listening transition in between the check and
+    ///     the claim.
+    ///   • We never touch the conversation lock (the brain turn holds it for
+    ///     its whole duration — see the lock contract on `conversation`).
+    ///   • The TTS handle is stored in `self.speech`, so ⌘⇧S (`stop`) and the
+    ///     ⌘⇧J toggle kill a proactive blurb just like a normal reply.
+    pub fn try_announce(&self, app: &AppHandle, text: &str) -> bool {
+        // Atomically claim Speaking: verify at-rest and flip under the lock.
+        {
+            let mut s = self.state.write();
+            if *s != JarvisState::Idle
+                || self.session_active()
+                || crate::gate::has_pending()
+            {
+                return false;
+            }
+            *s = JarvisState::Speaking;
+        }
+        // Surface the blurb in the HUD response area too (mirrors the normal
+        // voice path, which emits jarvis:response before Speaking).
+        let _ = app.emit("jarvis:response", text.to_string());
+        let _ = app.emit("jarvis:state", JarvisState::Speaking);
+        tracing::info!("proactive: speaking dev-agent update");
+
+        // Go deaf so the mic can't capture our own TTS and reply to itself.
+        if let Some(pipe) = self.pipe.get() {
+            pipe.clear_rolling();
+            pipe.set_mic_suppressed(true);
+        }
+
+        // Speak as a killable subprocess (stored so stop/toggle can interrupt).
+        match tts::start_speaking(text) {
+            Ok(h) => {
+                let h = Arc::new(h);
+                *self.speech.lock() = Some(h.clone());
+                let _ = h.wait_blocking();
+                // Only clear the slot if it's still ours (a kill already took it).
+                let mut cur = self.speech.lock();
+                if cur.as_ref().map(|c| Arc::ptr_eq(c, &h)).unwrap_or(false) {
+                    *cur = None;
+                }
+            }
+            Err(e) => tracing::warn!("proactive tts: {e}"),
+        }
+
+        // Drain the speaker, then re-open the mic (mirrors end_recording).
+        std::thread::sleep(std::time::Duration::from_millis(SPEAK_REARM_COOLDOWN_MS));
+        if let Some(pipe) = self.pipe.get() {
+            pipe.set_mic_suppressed(false);
+        }
+
+        // Return to Idle — but only if we're still Speaking. A stop / toggle /
+        // wake word may have moved us on (and killed the TTS above); never
+        // clobber that, and never start a conversation session — this was an
+        // unsolicited blurb, not a turn the user opened.
+        {
+            let mut s = self.state.write();
+            if *s == JarvisState::Speaking {
+                *s = JarvisState::Idle;
+                let _ = app.emit("jarvis:state", JarvisState::Idle);
+                if let Some(pipe) = self.pipe.get() {
+                    pipe.clear_rolling();
+                }
+            }
+        }
+        true
+    }
+
     /// Reserved for when automatic barge-in is re-enabled (after we ship
     /// proper AEC). Currently the audio pipe never fires barge_in events
     /// because is_speaking_mode stays false.

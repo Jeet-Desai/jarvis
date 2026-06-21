@@ -20,6 +20,7 @@ Hard-won rules baked in (from the Phase-0 spike):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -197,6 +198,11 @@ class Agent:
             "cost_usd": round(self.cost_usd, 4),
             "turns": self.turns,
             "last": self.last_text[:200],
+            "created": round(self.created, 1),
+            # An in-process Agent is always live (has a usable ClaudeSDKClient).
+            # Records resurrected from the on-disk registry get live=False — the
+            # SDK session can't be revived, so they're roster-only.
+            "live": True,
         }
 
 
@@ -206,6 +212,17 @@ class AgentManager:
         self.default_model = default_model
         self.agents: dict[str, Agent] = {}
         self.agents_root.mkdir(parents=True, exist_ok=True)
+        # Persistence: a JSON roster written on spawn + every status change and
+        # reloaded here, so a sidecar/app restart still shows past agents (their
+        # last status + on-disk worktree) as detached (live=False). The live SDK
+        # session itself can't be revived — this preserves the roster only.
+        self.registry_path = Path(
+            os.environ.get(
+                "JARVIS_AGENTS_REGISTRY",
+                str(self.agents_root.parent / "agents-registry.json"),
+            )
+        ).expanduser()
+        self.registry: dict[str, dict] = self._load_registry()
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -307,9 +324,10 @@ class AgentManager:
         log.info("[%s/%s] SPAWN     | project=%s worktree=%s model=%s",
                  name, agent_id, project, worktree, model)
         self._event(agent, "spawn", task)
+        self._persist(agent)  # roster entry exists the moment the agent is born
 
         await client.query(task)
-        agent.status = "working"
+        self._set_status(agent, "working")
         return agent.summary()
 
     async def instruct(self, agent_id: str, instruction: str) -> dict:
@@ -317,7 +335,7 @@ class AgentManager:
         agent = self._get(agent_id)
         self._event(agent, "instruct", instruction)
         await agent.client.query(instruction)
-        agent.status = "working"
+        self._set_status(agent, "working")
         return agent.summary()
 
     async def stop(self, agent_id: str, remove_worktree: bool = False) -> dict:
@@ -333,7 +351,7 @@ class AgentManager:
             await agent.client.disconnect()
         except Exception:
             pass
-        agent.status = "stopped"
+        self._set_status(agent, "stopped")
         self._event(agent, "stop", "stopped by orchestrator")
         # Only a real worktree can be `git worktree remove`d. For a directly-built
         # project the worktree IS the project dir — don't delete the user's work.
@@ -345,13 +363,26 @@ class AgentManager:
     # ── reads (sync; cheap control-plane queries) ────────────────────────────
 
     def list(self) -> list[dict]:
-        return [a.summary() for a in self.agents.values()]
+        """Live agents (this process) merged with detached history from the
+        registry, newest first. Live agents override their persisted record."""
+        merged: dict[str, dict] = dict(self.registry)  # detached, live=False
+        for aid, a in self.agents.items():
+            merged[aid] = a.summary()                   # live, live=True
+        return sorted(merged.values(), key=lambda r: r.get("created", 0), reverse=True)
 
     def status(self, agent_id: str) -> dict:
-        agent = self._get(agent_id)
-        s = agent.summary()
-        s["events"] = list(agent.events)[-15:]
-        return s
+        if agent_id in self.agents:
+            agent = self.agents[agent_id]
+            s = agent.summary()
+            s["events"] = list(agent.events)[-15:]
+            return s
+        # Detached agent from a previous run: serve its last-known record. Its
+        # live event deque is gone, so events is empty.
+        if agent_id in self.registry:
+            rec = dict(self.registry[agent_id])
+            rec.setdefault("events", [])
+            return rec
+        raise KeyError(f"no agent with id {agent_id!r}")
 
     # ── internals ────────────────────────────────────────────────────────────
 
@@ -360,26 +391,28 @@ class AgentManager:
         try:
             async for msg in agent.client.receive_messages():
                 if isinstance(msg, AssistantMessage):
-                    agent.status = "working"
                     for b in msg.content:
                         if isinstance(b, TextBlock) and b.text.strip():
                             agent.last_text = b.text.strip()
                             self._event(agent, "say", b.text.strip())
                         elif isinstance(b, ToolUseBlock):
                             self._event(agent, "tool", _tool_brief(b))
+                    self._set_status(agent, "working")
                 elif isinstance(msg, ResultMessage):
                     agent.turns += 1
                     if msg.total_cost_usd:
                         agent.cost_usd += msg.total_cost_usd
-                    agent.status = "error" if msg.is_error else "idle"
                     self._event(
                         agent, "turn_done",
                         f"turn {agent.turns} done (cost=${msg.total_cost_usd}, error={msg.is_error})",
                     )
+                    # Persist AFTER turns/cost/last_text are updated so the
+                    # registry snapshot captures the finished turn.
+                    self._set_status(agent, "error" if msg.is_error else "idle")
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 - a dead stream must mark the agent, not crash the server
-            agent.status = "error"
+            self._set_status(agent, "error")
             self._event(agent, "error", repr(e))
 
     def _event(self, agent: Agent, kind: str, text: str) -> None:
@@ -391,3 +424,67 @@ class AgentManager:
         if agent_id not in self.agents:
             raise KeyError(f"no agent with id {agent_id!r}")
         return self.agents[agent_id]
+
+    # ── persistence (the on-disk roster) ─────────────────────────────────────
+
+    def _set_status(self, agent: Agent, status: str) -> None:
+        """Set status and persist the registry on any actual change — the single
+        choke point for status writes, so 'persist on every status change' holds
+        without scattering registry writes through the lifecycle methods.
+
+        Persist ONLY on a real transition: the drain loop calls this with
+        "working" on every assistant message, and we don't want one disk write
+        per message. The turn-completion transition (→idle/→error) is itself a
+        change, and by then turns/cost/last_text are already updated, so the
+        persisted snapshot still captures the finished turn."""
+        if agent.status != status:
+            agent.status = status
+            self._persist(agent)
+
+    def _snapshot(self, agent: Agent) -> dict:
+        """Full persistable record: the HUD summary plus the fields needed to
+        recall a detached agent later (where its project/worktree lives)."""
+        s = agent.summary()
+        s["project_dir"] = str(agent.project_dir)
+        s["is_worktree"] = agent.is_worktree
+        return s
+
+    def _persist(self, agent: Agent) -> None:
+        self.registry[agent.id] = self._snapshot(agent)
+        self._write_registry()
+
+    def _write_registry(self) -> None:
+        """Atomically rewrite the whole roster. Best-effort: a persistence
+        failure must never break an agent (mirrors the logging guard above)."""
+        try:
+            self.registry_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.registry_path.with_name(self.registry_path.name + ".tmp")
+            tmp.write_text(json.dumps(self.registry, indent=2))
+            tmp.replace(self.registry_path)  # atomic on POSIX
+        except Exception:  # noqa: BLE001
+            log.warning("could not write agents registry", exc_info=True)
+
+    def _load_registry(self) -> dict[str, dict]:
+        """Load the roster from disk, marking every record detached (live=False)
+        — the SDK sessions died with the previous process. A transient status
+        (spawning/working) is downgraded to idle, since nothing in THIS process
+        is draining that agent; otherwise the HUD would pulse 'working' forever."""
+        try:
+            if not self.registry_path.exists():
+                return {}
+            data = json.loads(self.registry_path.read_text())
+            if not isinstance(data, dict):
+                return {}
+            out: dict[str, dict] = {}
+            for aid, rec in data.items():
+                if not isinstance(rec, dict):
+                    continue
+                rec = dict(rec)
+                rec["live"] = False
+                if rec.get("status") in ("spawning", "working"):
+                    rec["status"] = "idle"
+                out[str(aid)] = rec
+            return out
+        except Exception:  # noqa: BLE001 - a corrupt registry must not stop startup
+            log.warning("could not load agents registry; starting fresh", exc_info=True)
+            return {}
