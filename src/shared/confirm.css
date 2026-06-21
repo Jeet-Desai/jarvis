@@ -233,6 +233,49 @@
   box-shadow: 0 0 5px var(--danger, var(--jarvis-cyan));
 }
 
+/* ────────── dev-agent roster (AGENTS panel) ────────── */
+.jv-agent-row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  line-height: 1.3;
+  padding: 5px 8px;
+  border-radius: 3px;
+  background: rgba(8, 22, 34, 0.45);
+  border: 1px solid rgba(65, 227, 255, 0.12);
+  animation: jv-fade-in 160ms ease-out;
+}
+.jv-agent-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.jv-agent-name {
+  flex: 1;
+  min-width: 0;
+  color: #cfeeff;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.jv-agent-meta {
+  flex: none;
+  font-size: 9px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: rgba(229, 246, 255, 0.5);
+}
+.jv-agent-last {
+  padding-left: 22px;
+  color: rgba(207, 238, 255, 0.6);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 @keyframes jv-pulse {
   0%, 100% { opacity: 0.4; }
   50%      { opacity: 1; }

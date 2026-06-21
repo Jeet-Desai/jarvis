@@ -16,11 +16,13 @@ manager = AgentManager()
 
 
 @mcp.tool()
-async def spawn_dev_agent(project_dir: str, task: str, name: str = "") -> dict:
-    """Spawn an autonomous Claude Code dev agent in an isolated git worktree to
-    work on `task`. `project_dir` is the absolute path of the git repo to work in.
-    Returns the agent's id, branch, worktree, and status. The agent runs in the
-    background — poll get_agent_status or list_dev_agents to follow it."""
+async def spawn_dev_agent(task: str, project_dir: str = "", name: str = "") -> dict:
+    """Spawn an autonomous Claude Code dev agent to work on `task` in an isolated
+    git worktree. `project_dir` is OPTIONAL: pass an existing git repo's path to
+    work inside it, OR a short project name (or leave it empty) to create a
+    BRAND-NEW project under ~/claude/jarvis-workspace/projects. Returns the
+    agent's id, branch, worktree, and status. The agent runs in the background —
+    poll get_agent_status or list_dev_agents to follow it."""
     return await manager.spawn(project_dir, task, name or None)
 
 

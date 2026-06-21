@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## ⛔ HARD RULE — protected-paths (never violate)
+
+This is a PERSONAL project. It (and the agents it spawns) must **NEVER** touch the user's protected files. Off-limits in every mode, no exceptions: any path matching the markers in `JARVIS_PROTECTED_PATHS`. The user handles those projects in a *separate* session — this project must stay completely out of them. Do not read, write, run, build, open, or `cd` into them; don't add other git identities/remotes. Enforced in code (`policy.rs::protected_path_guard` — hard-deny even in dev; `orchestrator/manager.py::_assert_not_protected`) and in the system prompts; keep all of those intact. Set the markers via `JARVIS_PROTECTED_PATHS`.
+
 ## Commands
 
 ```bash

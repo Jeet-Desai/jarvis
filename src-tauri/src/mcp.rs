@@ -4,7 +4,8 @@
 //! connections, exposes a sync API for the rest of Jarvis (which lives in
 //! sync land via reqwest::blocking, parking_lot, etc).
 //!
-//! Today: only the Google Calendar server (@cocal/google-calendar-mcp).
+//! Today: the Google Calendar server (@cocal/google-calendar-mcp) and the
+//! Jarvis dev-agent orchestrator (the local Python sidecar in `orchestrator/`).
 //! Easy to add more — wrap another `OnceLock<Peer>` on `McpManager`.
 //!
 //! Async ↔ sync bridge: a dedicated multi-thread tokio runtime is built
@@ -15,6 +16,7 @@
 use anyhow::{anyhow, bail, Result};
 use rmcp::{
     model::CallToolRequestParam,
+    service::RunningService,
     transport::{ConfigureCommandExt, TokioChildProcess},
     RoleClient, ServiceExt,
 };
@@ -25,8 +27,14 @@ use tokio::runtime::Runtime;
 
 pub struct McpManager {
     runtime: Runtime,
-    /// Long-lived peer (RPC client handle) to the calendar MCP subprocess.
-    calendar_peer: OnceLock<rmcp::service::Peer<RoleClient>>,
+    /// Long-lived RunningService for the calendar MCP subprocess. We keep the
+    /// whole `RunningService` (not just its `peer()`) ALIVE on purpose: it owns
+    /// a `DropGuard` that cancels the connection the instant it's dropped, which
+    /// would tear down the subprocess transport right after the handshake
+    /// ("Transport closed"). Hold it for the life of the manager.
+    calendar: OnceLock<RunningService<RoleClient, ()>>,
+    /// Same, for the dev-agent orchestrator sidecar (`orchestrator/`).
+    orchestrator: OnceLock<RunningService<RoleClient, ()>>,
 }
 
 static GLOBAL: OnceLock<Arc<McpManager>> = OnceLock::new();
@@ -44,7 +52,8 @@ impl McpManager {
             .build()?;
         Ok(Arc::new(Self {
             runtime,
-            calendar_peer: OnceLock::new(),
+            calendar: OnceLock::new(),
+            orchestrator: OnceLock::new(),
         }))
     }
 
@@ -63,7 +72,7 @@ impl McpManager {
         }
         let creds = credentials_path.to_string();
 
-        let peer = self.runtime.block_on(async move {
+        let service = self.runtime.block_on(async move {
             let transport =
                 TokioChildProcess::new(TokioCommand::new("npx").configure(|c| {
                     c.arg("-y")
@@ -71,19 +80,18 @@ impl McpManager {
                         .env("GOOGLE_OAUTH_CREDENTIALS", &creds);
                 }))?;
             let service = ().serve(transport).await?;
-            let peer = service.peer().clone();
             // List tools once so we log what's available (and warm the cache)
-            match peer.list_all_tools().await {
+            match service.peer().list_all_tools().await {
                 Ok(tools) => {
                     let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
                     tracing::info!("mcp[calendar]: {} tools — {}", names.len(), names.join(", "));
                 }
                 Err(e) => tracing::warn!("mcp[calendar]: list_all_tools failed: {e}"),
             }
-            Ok::<_, anyhow::Error>(peer)
+            Ok::<_, anyhow::Error>(service)
         })?;
 
-        let _ = self.calendar_peer.set(peer);
+        let _ = self.calendar.set(service);
         tracing::info!("mcp[calendar]: connected");
         Ok(())
     }
@@ -91,13 +99,14 @@ impl McpManager {
     /// Call a tool on the calendar MCP server. Blocks until reply received.
     pub fn calendar_call(&self, tool_name: &str, args: Value) -> Result<Value> {
         let peer = self
-            .calendar_peer
+            .calendar
             .get()
             .ok_or_else(|| {
                 anyhow!(
                     "Calendar MCP is not configured. Tell the user to set GOOGLE_OAUTH_CREDENTIALS in .env (see README)."
                 )
             })?
+            .peer()
             .clone();
         let args_map = args.as_object().cloned();
         let tool_name = tool_name.to_string();
@@ -120,6 +129,93 @@ impl McpManager {
             Ok(Ok(r)) => Ok(extract_text_content(&r)),
             Ok(Err(e)) => Err(e.into()),
             Err(_) => bail!("MCP call timed out after 15s — the server may be slow or stuck"),
+        }
+    }
+
+    /// Spawn the dev-agent orchestrator sidecar and complete the handshake.
+    /// `dir` is the absolute path to the `orchestrator/` package; we launch its
+    /// own venv interpreter (`.venv/bin/python server.py`) so it gets the
+    /// `claude-agent-sdk` deps regardless of the system Python. The subprocess
+    /// inherits Jarvis's environment (so the agent SDK sees ANTHROPIC_API_KEY).
+    pub fn init_orchestrator(&self, dir: &str) -> Result<()> {
+        let dir = std::path::Path::new(dir);
+        let python = dir.join(".venv/bin/python");
+        let server = dir.join("server.py");
+        if !python.exists() {
+            bail!(
+                "orchestrator venv missing at {} — run `cd orchestrator && uv venv --python 3.12 && uv pip install claude-agent-sdk mcp`",
+                python.display()
+            );
+        }
+        if !server.exists() {
+            bail!("orchestrator server.py missing at {}", server.display());
+        }
+        let python = python.to_string_lossy().into_owned();
+        let cwd = dir.to_string_lossy().into_owned();
+
+        let service = self.runtime.block_on(async move {
+            let transport =
+                TokioChildProcess::new(TokioCommand::new(&python).configure(|c| {
+                    c.arg("server.py").current_dir(&cwd);
+                }))?;
+            let service = ().serve(transport).await?;
+            match service.peer().list_all_tools().await {
+                Ok(tools) => {
+                    let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+                    tracing::info!(
+                        "mcp[orchestrator]: {} tools — {}",
+                        names.len(),
+                        names.join(", ")
+                    );
+                }
+                Err(e) => tracing::warn!("mcp[orchestrator]: list_all_tools failed: {e}"),
+            }
+            Ok::<_, anyhow::Error>(service)
+        })?;
+
+        let _ = self.orchestrator.set(service);
+        tracing::info!("mcp[orchestrator]: connected");
+        Ok(())
+    }
+
+    /// True once the orchestrator sidecar is connected. Used by the background
+    /// poll task to decide whether there's anything to poll.
+    pub fn orchestrator_ready(&self) -> bool {
+        self.orchestrator.get().is_some()
+    }
+
+    /// Call a tool on the orchestrator sidecar. Blocks until reply received.
+    /// A generous 60s timeout: `spawn_dev_agent` does a `git worktree add` plus
+    /// an SDK `connect()` before returning, which can take a while on first use.
+    pub fn orchestrator_call(&self, tool_name: &str, args: Value) -> Result<Value> {
+        let peer = self
+            .orchestrator
+            .get()
+            .ok_or_else(|| {
+                anyhow!(
+                    "Dev-agent orchestrator is not running. Make sure the `orchestrator/` venv is set up (see orchestrator/README.md)."
+                )
+            })?
+            .peer()
+            .clone();
+        let args_map = args.as_object().cloned();
+        let tool_name = tool_name.to_string();
+
+        let result = self.runtime.block_on(async move {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                peer.call_tool(CallToolRequestParam {
+                    name: tool_name.into(),
+                    arguments: args_map,
+                }),
+            )
+            .await
+        });
+
+        match result {
+            Ok(Ok(r)) => Ok(extract_text_content(&r)),
+            Ok(Err(e)) => Err(e.into()),
+            Err(_) => bail!("Orchestrator call timed out after 60s — the sidecar may be stuck"),
         }
     }
 }

@@ -17,9 +17,10 @@ import subprocess
 import time
 from pathlib import Path
 
-from manager import AgentManager
+from manager import AgentManager, AGENTS_ROOT
 
-PROJ = Path.home() / ".jarvis-test" / "demo"     # scratch "user project" repo
+# scratch "user project" repo — kept in the same visible workspace as the agents
+PROJ = AGENTS_ROOT.parent / "test-project" / "demo"
 PASS, FAIL = "\033[92mPASS\033[0m", "\033[91mFAIL\033[0m"
 
 

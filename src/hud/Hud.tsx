@@ -3,6 +3,7 @@ import { state, transcript, response, level, policyMode, initStateBridge } from 
 import { OrbScene } from "../shared/OrbScene";
 import { ConfirmationPrompt } from "../shared/ConfirmationPrompt";
 import { ActivityFeed } from "../shared/ActivityFeed";
+import { AgentsPanel } from "../shared/AgentsPanel";
 import "./hud.css";
 
 export function Hud() {
@@ -50,6 +51,12 @@ export function Hud() {
       <div class="hud-activity-panel">
         <div class="hud-panel-label">ACTIVITY</div>
         <ActivityFeed limit={8} />
+      </div>
+
+      {/* Right panel — live dev-agent roster (orchestrator sidecar) */}
+      <div class="hud-agents-panel">
+        <div class="hud-panel-label">AGENTS</div>
+        <AgentsPanel limit={6} />
       </div>
 
       {/* Large center orb */}

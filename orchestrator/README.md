@@ -26,8 +26,11 @@ uv run python server.py          # run as an MCP stdio server (what Jarvis spawn
 ```
 
 ## Design rules (learned the hard way in the Phase-0 spike)
-- **Agent worktrees live outside any enclosing repo** (`~/.jarvis/agents/<project>/<id>`),
-  else Claude Code auto-discovers a parent `CLAUDE.md` and writes to the wrong root.
+- **Agent worktrees live outside any enclosing repo** — `AGENTS_ROOT` auto-resolves
+  to the nearest non-repo ancestor of the jarvis repo, in a visible
+  `jarvis-workspace/agents/` (e.g. `~/claude/jarvis-workspace/agents/`). Override with
+  the `JARVIS_AGENTS_ROOT` env var. If worktrees sit inside a repo, Claude Code
+  auto-discovers a parent `CLAUDE.md` and writes to the wrong root.
 - **`setting_sources=[]`** so no external `CLAUDE.md`/settings bleed into agents.
 - **Pin the workspace in an appended system prompt** + set `cwd`/`add_dirs` — Claude
   Code's Write tool otherwise resolves bare relative paths to `$HOME`.

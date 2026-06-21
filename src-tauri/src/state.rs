@@ -10,6 +10,11 @@ use crate::brain::{self, Brain, Message};
 use crate::stt;
 use crate::tts::{self, SpeechHandle};
 
+/// After TTS finishes we keep the mic deaf for this long so the speaker output
+/// fully drains before re-arming — otherwise the first frames of the next
+/// Listening window catch the tail of Jarvis's own voice (self-listening).
+const SPEAK_REARM_COOLDOWN_MS: u64 = 400;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum JarvisState {
@@ -111,6 +116,12 @@ impl AppState {
         }
 
         if next == JarvisState::Listening && prev != JarvisState::Listening {
+            // Any path into Listening (wake word, manual toggle/barge-in,
+            // conversation re-arm) must have a live mic — clear suppression in
+            // case we're arriving straight from Speaking.
+            if let Some(pipe) = self.pipe.get() {
+                pipe.set_mic_suppressed(false);
+            }
             self.begin_recording(app);
         } else if prev == JarvisState::Listening && next != JarvisState::Listening {
             self.end_recording(app);
@@ -211,6 +222,12 @@ impl AppState {
             let _ = app.emit("jarvis:response", reply.clone());
             st.set(&app, JarvisState::Speaking);
 
+            // Go deaf while speaking so the mic can't capture our own TTS and
+            // reply to itself. Released after the speech + a drain cooldown below.
+            if let Some(pipe) = st.pipe.get() {
+                pipe.set_mic_suppressed(true);
+            }
+
             // Start TTS as a killable subprocess; store the handle so the
             // barge-in handler in another thread can interrupt it.
             let speech_handle = match tts::start_speaking(&reply) {
@@ -237,6 +254,13 @@ impl AppState {
             let _ = speech_handle.wait_blocking();
 
             *st.speech.lock() = None;
+
+            // Let the speaker output fully drain, then re-open the mic (clear +
+            // VAD reset happen inside set_mic_suppressed) before re-arming.
+            std::thread::sleep(std::time::Duration::from_millis(SPEAK_REARM_COOLDOWN_MS));
+            if let Some(pipe) = st.pipe.get() {
+                pipe.set_mic_suppressed(false);
+            }
 
             // After TTS finishes naturally:
             //   - If we're in conversation mode → re-arm the mic immediately
@@ -310,6 +334,7 @@ impl AppState {
         self.kill_current_speech();
         if let Some(pipe) = self.pipe.get() {
             pipe.stop_speaking_mode();
+            pipe.set_mic_suppressed(false);
         }
         self.set(app, JarvisState::Idle);
     }

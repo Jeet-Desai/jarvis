@@ -21,6 +21,21 @@ export interface PendingConfirm {
   danger: Danger;
 }
 
+/** A dev agent in the orchestrator sidecar (mirrors AgentManager.summary()). */
+export type AgentStatus = "spawning" | "working" | "idle" | "stopped" | "error";
+
+export interface AgentItem {
+  id: string;
+  name: string;
+  status: AgentStatus;
+  branch: string;
+  worktree: string;
+  model: string;
+  cost_usd: number;
+  turns: number;
+  last: string;
+}
+
 export const [state, setState] = createSignal<JarvisState>("idle");
 export const [level, setLevel] = createSignal<number>(0); // 0..1 audio level
 export const [transcript, setTranscript] = createSignal<string>("");
@@ -35,6 +50,9 @@ export const [activity, setActivity] = createSignal<ActivityItem[]>([]);
 export const [pendingConfirm, setPendingConfirm] = createSignal<PendingConfirm | null>(null);
 /** Backend policy mode: "safe" | "trusted" | "dev". Fetched once on init. */
 export const [policyMode, setPolicyMode] = createSignal<string>("");
+
+/** Live dev-agent roster, refreshed ~every 2s by the backend poll task. */
+export const [agents, setAgents] = createSignal<AgentItem[]>([]);
 
 const MAX_ACTIVITY = 12;
 
@@ -67,6 +85,10 @@ export async function initStateBridge() {
       return [item, ...prev].slice(0, MAX_ACTIVITY);
     });
   });
+
+  // Full dev-agent roster snapshot (not merged — the backend sends the whole
+  // list each poll, so replacing is correct and reflects removals).
+  await listen<AgentItem[]>("jarvis:agent", (e) => setAgents(e.payload ?? []));
 
   await listen<PendingConfirm>("jarvis:confirm", (e) => setPendingConfirm(e.payload));
 

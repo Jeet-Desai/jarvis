@@ -20,6 +20,9 @@ Hard-won rules baked in (from the Phase-0 spike):
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
+import re
 import subprocess
 import time
 import uuid
@@ -37,15 +40,122 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
-# Agent worktrees live here — a dedicated area OUTSIDE any project/jarvis repo.
-AGENTS_ROOT = Path.home() / ".jarvis" / "agents"
+def _inside_git_repo(d: Path) -> bool:
+    """True if d or any ancestor contains a .git (i.e. d is inside a git repo)."""
+    return any((p / ".git").exists() for p in (d, *d.parents))
+
+
+def _default_agents_root() -> Path:
+    """Where agent worktrees live. MUST be outside any git repo — otherwise Claude
+    Code walks up, finds an enclosing CLAUDE.md/repo, and writes to the wrong root
+    (the Phase-0 spike bug). Override with the JARVIS_AGENTS_ROOT env var.
+
+    Default: walk up from the jarvis repo to the nearest ancestor NOT inside any
+    git repo, then use a dedicated, VISIBLE `jarvis-workspace/agents/` there — e.g.
+    ~/claude/jarvis-workspace/agents (a sibling of the repo's parent, not hidden in
+    $HOME). This is the single home for everything Jarvis does outside its repo."""
+    env = os.environ.get("JARVIS_AGENTS_ROOT")
+    if env:
+        return Path(env).expanduser().resolve()
+    d = Path(__file__).resolve().parents[1].parent  # parent of the jarvis repo
+    while _inside_git_repo(d) and d != d.parent:
+        d = d.parent
+    return d / "jarvis-workspace" / "agents"
+
+
+AGENTS_ROOT = _default_agents_root()
+# Where brand-NEW projects (e.g. "build me a website") are created when the
+# caller didn't point at an existing git repo. Sibling of AGENTS_ROOT, so
+# everything Jarvis makes lives together under (by default) ~/claude/
+# jarvis-workspace/. Override with JARVIS_PROJECTS_ROOT.
+PROJECTS_ROOT = Path(
+    os.environ.get("JARVIS_PROJECTS_ROOT", str(AGENTS_ROOT.parent / "projects"))
+).expanduser()
 # Default to a cheaper model than Opus for a fleet; caller can override per spawn.
 DEFAULT_MODEL = "sonnet"
 DEFAULT_ALLOWED_TOOLS = ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
 
+# Tailable activity log for dev agents (everything each agent says / every tool
+# it runs / spawn / stop / error), so the build can be watched from outside the
+# in-memory event deque: `tail -f ~/claude/jarvis-workspace/orchestrator.log`.
+# Override with JARVIS_ORCH_LOG. A dedicated logger (not root/basicConfig) so it
+# doesn't capture the MCP server's request spam.
+LOG_PATH = Path(
+    os.environ.get("JARVIS_ORCH_LOG", str(AGENTS_ROOT.parent / "orchestrator.log"))
+).expanduser()
+log = logging.getLogger("jarvis.orchestrator")
+if not log.handlers:
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _h = logging.FileHandler(LOG_PATH)
+        _h.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        log.addHandler(_h)
+        log.setLevel(logging.INFO)
+        log.propagate = False
+    except Exception:  # logging must never break the orchestrator
+        pass
+
 
 def _run(args: list[str], cwd: Optional[Path] = None) -> subprocess.CompletedProcess:
     return subprocess.run(args, cwd=cwd, capture_output=True, text=True)
+
+
+def _slug(s: str) -> str:
+    """Filesystem-safe lowercase project name from arbitrary text."""
+    s = re.sub(r"[^A-Za-z0-9._-]+", "-", (s or "").strip()).strip("-_.")
+    return s[:60].lower()
+
+
+# HARD RULE: dev agents must NEVER touch the user's protected files. Mirror of
+# the Rust policy guard (policy.rs `protected_path_guard`), enforced here too so a
+# protected path is refused before any dir/repo is created. There are no
+# built-in names; set them via JARVIS_PROTECTED_PATHS (comma-separated).
+_PROTECTED_PATHS = [
+    s.strip().lower() for s in os.environ.get("JARVIS_PROTECTED_PATHS", "").split(",") if s.strip()
+]
+
+
+def _assert_not_protected(*candidates: str) -> None:
+    for c in candidates:
+        lc = str(c or "").lower()
+        hit = next((n for n in _PROTECTED_PATHS if n in lc), None)
+        if hit:
+            raise ValueError(
+                f"Refused: dev agents must never work on protected files (matched '{hit}'). "
+                "Hard rule in every mode — use a separate Claude Code session for those."
+            )
+
+
+def _commit_identity() -> tuple[str, str]:
+    """The git identity agent projects commit as. PRIVACY: never fall through to
+    the machine's GLOBAL git config, which may not be the identity you want —
+    agent work must not be authored with that. Order: JARVIS_GIT_NAME/EMAIL env
+    → the jarvis repo's own identity (the "same GitHub as the jarvis folder")
+    → a neutral local placeholder."""
+    n, e = os.environ.get("JARVIS_GIT_NAME"), os.environ.get("JARVIS_GIT_EMAIL")
+    if n and e:
+        return n, e
+    repo = Path(__file__).resolve().parents[1]  # the jarvis repo
+    n = _run(["git", "-C", str(repo), "config", "user.name"]).stdout.strip()
+    e = _run(["git", "-C", str(repo), "config", "user.email"]).stdout.strip()
+    if n and e:
+        return n, e
+    return "Jarvis", "jarvis@local"
+
+
+def _git_init(p: Path) -> None:
+    """Init a git repo with a neutral LOCAL identity (see _commit_identity)
+    and one empty commit, so `git worktree add … HEAD` works and the agent's own
+    later commits inherit that identity (local config overrides the global one)."""
+    name, email = _commit_identity()
+    _run(["git", "init"], cwd=p)
+    _run(["git", "config", "user.name", name], cwd=p)
+    _run(["git", "config", "user.email", email], cwd=p)
+    _run(
+        ["git", "-c", f"user.name={name}", "-c", f"user.email={email}",
+         "commit", "--allow-empty", "-m", "Initial commit (Jarvis)"],
+        cwd=p,
+    )
 
 
 def _tool_brief(block: ToolUseBlock) -> str:
@@ -67,6 +177,7 @@ class Agent:
     branch: str
     client: ClaudeSDKClient
     model: str
+    is_worktree: bool = True        # False = built directly in the project dir
     status: str = "spawning"        # spawning | working | idle | stopped | error
     cost_usd: float = 0.0
     turns: int = 0
@@ -98,6 +209,34 @@ class AgentManager:
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
+    def _resolve_project(self, project_dir: str, fallback_name: str) -> tuple[Path, bool]:
+        """Return (path, build_directly).
+
+        - Existing git REPO → build_directly=False: isolate the agent in its own
+          worktree+branch so the user's working tree is never touched.
+        - A bare name / empty / an existing non-repo dir → build_directly=True:
+          a project Jarvis owns, built IN PLACE (files land right in the project
+          dir — no empty base repo + separate worktree split). New projects live
+          under PROJECTS_ROOT (~/claude), so "build me a website" just works."""
+        raw = (project_dir or "").strip()
+        _assert_not_protected(raw, fallback_name)  # hard protected-paths rule
+        looks_like_path = raw.startswith(("/", "~", ".")) or "/" in raw
+        if raw and looks_like_path:
+            p = Path(raw).expanduser().resolve()
+            _assert_not_protected(str(p))
+            if (p / ".git").exists():
+                return p, False          # existing repo → worktree isolation
+            if p.exists():
+                _git_init(p)
+                return p, True           # their dir, now a repo → build in place
+        # New project: derive a name and create it under PROJECTS_ROOT.
+        base = raw if (raw and not looks_like_path) else fallback_name
+        proj = PROJECTS_ROOT / (_slug(base) or f"project-{uuid.uuid4().hex[:6]}")
+        proj.mkdir(parents=True, exist_ok=True)
+        if not (proj / ".git").exists():
+            _git_init(proj)
+        return proj, True                # brand-new → build in place
+
     async def spawn(
         self,
         project_dir: str,
@@ -105,22 +244,32 @@ class AgentManager:
         name: Optional[str] = None,
         model: Optional[str] = None,
     ) -> dict:
-        """Create an isolated worktree and launch an agent on `task`. Returns at once."""
-        project = Path(project_dir).expanduser().resolve()
-        if not (project / ".git").exists():
-            raise ValueError(
-                f"{project} is not a git repository — worktree isolation needs one."
-            )
+        """Create an isolated worktree and launch an agent on `task`. Returns at once.
 
+        `project_dir` may be an existing git repo, OR a short name / empty — in
+        which case a fresh project is created under PROJECTS_ROOT (~/claude)."""
         agent_id = uuid.uuid4().hex[:8]
+        # Name a brand-new project from an explicit name, else from the task.
+        fallback = name or _slug(" ".join(task.split()[:5])) or f"project-{agent_id}"
+        project, build_directly = self._resolve_project(project_dir, fallback)
         name = name or f"agent-{agent_id}"
-        branch = f"agent/{agent_id}"
-        worktree = self.agents_root / project.name / agent_id
-        worktree.parent.mkdir(parents=True, exist_ok=True)
 
-        r = _run(["git", "worktree", "add", "-b", branch, str(worktree), "HEAD"], cwd=project)
-        if r.returncode != 0:
-            raise RuntimeError(f"git worktree add failed: {r.stderr.strip()}")
+        if build_directly:
+            # New/owned project → agent works straight in the project dir. One
+            # obvious location; no empty base repo + separate worktree.
+            worktree = project
+            cur = _run(["git", "branch", "--show-current"], cwd=project)
+            branch = cur.stdout.strip() or "main"
+            is_worktree = False
+        else:
+            # Existing repo → isolate on its own branch in a worktree.
+            branch = f"agent/{agent_id}"
+            worktree = self.agents_root / project.name / agent_id
+            worktree.parent.mkdir(parents=True, exist_ok=True)
+            r = _run(["git", "worktree", "add", "-b", branch, str(worktree), "HEAD"], cwd=project)
+            if r.returncode != 0:
+                raise RuntimeError(f"git worktree add failed: {r.stderr.strip()}")
+            is_worktree = True
 
         model = model or self.default_model
         options = ClaudeAgentOptions(
@@ -135,9 +284,13 @@ class AgentManager:
                 "preset": "claude_code",
                 "append": (
                     "You are an autonomous software-development agent supervised by Jarvis. "
-                    f"Your ENTIRE workspace is the git worktree at {worktree}. Always create, "
-                    f"read, and edit files INSIDE {worktree}; never write outside it. When you "
-                    "finish a task, end with a one-line summary of what you changed."
+                    f"Your ENTIRE workspace is {worktree}. Always create, read, and edit files "
+                    f"INSIDE {worktree}; never write outside it. HARD RULE: never read, write, "
+                    "cd into, or run commands against the user's protected files — anything "
+                    "matching the configured protected markers is strictly off-limits. "
+                    "When you finish, run `git add -A && git commit -m \"<short summary>\"` so your "
+                    "work is saved to git (never leave it as untracked files), then end with a "
+                    "one-line summary of what you changed."
                 ),
             },
         )
@@ -147,10 +300,12 @@ class AgentManager:
 
         agent = Agent(
             id=agent_id, name=name, project_dir=project, worktree=worktree,
-            branch=branch, client=client, model=model,
+            branch=branch, client=client, model=model, is_worktree=is_worktree,
         )
         self.agents[agent_id] = agent
         agent.drain_task = asyncio.create_task(self._drain(agent))
+        log.info("[%s/%s] SPAWN     | project=%s worktree=%s model=%s",
+                 name, agent_id, project, worktree, model)
         self._event(agent, "spawn", task)
 
         await client.query(task)
@@ -180,7 +335,9 @@ class AgentManager:
             pass
         agent.status = "stopped"
         self._event(agent, "stop", "stopped by orchestrator")
-        if remove_worktree:
+        # Only a real worktree can be `git worktree remove`d. For a directly-built
+        # project the worktree IS the project dir — don't delete the user's work.
+        if remove_worktree and agent.is_worktree:
             _run(["git", "worktree", "remove", "--force", str(agent.worktree)],
                  cwd=agent.project_dir)
         return agent.summary()
@@ -227,6 +384,8 @@ class AgentManager:
 
     def _event(self, agent: Agent, kind: str, text: str) -> None:
         agent.events.append({"t": round(time.time(), 1), "kind": kind, "text": text[:240]})
+        # Mirror to the tailable log so the build is observable live.
+        log.info("[%s/%s] %-9s | %s", agent.name, agent.id, kind, text[:240].replace("\n", " "))
 
     def _get(self, agent_id: str) -> Agent:
         if agent_id not in self.agents:

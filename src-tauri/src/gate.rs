@@ -61,6 +61,15 @@ pub fn emit_activity(id: u64, tool: &str, summary: &str, danger: DangerLevel, st
     );
 }
 
+/// Push the current dev-agent roster to the HUD "AGENTS" panel. `agents` is the
+/// JSON array returned by the orchestrator's `list_dev_agents` (each entry has
+/// id/name/status/branch/cost_usd/turns/last). Emitted by the background poll
+/// task in lib.rs, not through `dispatch` — so it never shows up in the activity
+/// feed or takes the conversation lock.
+pub fn emit_agents(agents: Value) {
+    emit("jarvis:agent", agents);
+}
+
 // ── audit log (append-only JSONL) ──────────────────────────────────────────
 
 static AUDIT: OnceLock<Mutex<std::fs::File>> = OnceLock::new();

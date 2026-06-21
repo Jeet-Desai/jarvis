@@ -136,6 +136,85 @@ pub fn registry() -> Vec<Tool> {
             danger: DangerLevel::Mutating,
             handler: create_calendar_event,
         },
+        // ── dev-agent orchestrator (Python sidecar over MCP) ──────────────────
+        Tool {
+            name: "spawn_dev_agent",
+            declaration: json!({
+                "name": "spawn_dev_agent",
+                "description": "Spawn an autonomous Claude Code dev agent to work on a coding task in an isolated git worktree (its own branch). Use when the user says 'have an agent build X', 'spin up a coder to fix Y', 'build me a website', 'start working on Z in the background'. The agent runs autonomously (auto-applies edits, runs whitelisted shell) and works in the BACKGROUND — this call returns immediately. DESTRUCTIVE: writes code and runs commands — gated by the safety policy. After spawning, just tell the user it's started; do NOT poll its status in a loop (that blocks your turn). Returns the agent's id, branch, and worktree path.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task": { "type": "string", "description": "The coding task for the agent, in plain language (e.g. 'build an e-commerce storefront in React' or 'add a /health endpoint and a test')." },
+                        "project_dir": { "type": "string", "description": "OPTIONAL. An existing git repo's absolute path to work inside, OR a short name for a NEW project (created under ~/claude/jarvis-workspace/projects). Omit entirely for a brand-new project — a name is derived from the task." },
+                        "name": { "type": "string", "description": "Optional friendly name for the agent. Defaults to agent-<id>." }
+                    },
+                    "required": ["task"]
+                }
+            }),
+            danger: DangerLevel::Destructive,
+            handler: spawn_dev_agent,
+        },
+        Tool {
+            name: "instruct_dev_agent",
+            declaration: json!({
+                "name": "instruct_dev_agent",
+                "description": "Send a follow-up instruction to a running dev agent (its session is persistent — it remembers everything it has done). Use to steer, correct, or add to an agent's work, e.g. 'tell agent abc123 to also add tests', 'have it use TypeScript instead'. Pass the agent_id from spawn_dev_agent / list_dev_agents.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "agent_id":    { "type": "string", "description": "The id of the agent to instruct." },
+                        "instruction": { "type": "string", "description": "The follow-up instruction in plain language." }
+                    },
+                    "required": ["agent_id", "instruction"]
+                }
+            }),
+            danger: DangerLevel::Mutating,
+            handler: instruct_dev_agent,
+        },
+        Tool {
+            name: "list_dev_agents",
+            declaration: json!({
+                "name": "list_dev_agents",
+                "description": "List all dev agents with their status (spawning/working/idle/stopped/error), branch, cost so far, turn count, and last activity. Use for 'what are my agents doing', 'how's the agent going', 'list the agents'.",
+                "parameters": { "type": "object", "properties": {}, "required": [] }
+            }),
+            danger: DangerLevel::ReadOnly,
+            handler: list_dev_agents,
+        },
+        Tool {
+            name: "get_agent_status",
+            declaration: json!({
+                "name": "get_agent_status",
+                "description": "Get detailed status for ONE dev agent: state, cost, turn count, and its recent events (what it has been saying and which tools it used). Use when the user asks about a specific agent's progress. Pass the agent_id.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "agent_id": { "type": "string", "description": "The id of the agent to inspect." }
+                    },
+                    "required": ["agent_id"]
+                }
+            }),
+            danger: DangerLevel::ReadOnly,
+            handler: get_agent_status,
+        },
+        Tool {
+            name: "stop_dev_agent",
+            declaration: json!({
+                "name": "stop_dev_agent",
+                "description": "Interrupt and stop a dev agent. Use for 'stop the agent', 'kill agent abc123', 'cancel that'. Set remove_worktree=true to ALSO delete its git worktree — only do this once its work has been reviewed/merged or is being abandoned, since it is irreversible.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "agent_id":       { "type": "string", "description": "The id of the agent to stop." },
+                        "remove_worktree": { "type": "boolean", "description": "If true, also delete the agent's worktree. Default false (keeps the work for review)." }
+                    },
+                    "required": ["agent_id"]
+                }
+            }),
+            danger: DangerLevel::Mutating,
+            handler: stop_dev_agent,
+        },
         Tool {
             name: "type_text",
             declaration: json!({
@@ -633,6 +712,38 @@ fn normalize_calendar_args(args: &Value) -> Value {
         obj.insert("calendarId".into(), Value::String("primary".into()));
     }
     Value::Object(obj)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Dev-agent orchestrator tools — dispatched to the Python sidecar (orchestrator/)
+// via the global mcp::McpManager. The MCP tool names match these tool names, so
+// each handler just forwards its args. Spawning is gated as Destructive; the
+// worktree isolation keeps follow-up instructions recoverable (Mutating).
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn orchestrator_call(tool: &str, args: &Value) -> Result<Value> {
+    let mcp = crate::mcp::global().ok_or_else(|| anyhow::anyhow!("MCP manager not running"))?;
+    mcp.orchestrator_call(tool, args.clone())
+}
+
+fn spawn_dev_agent(args: &Value) -> Result<Value> {
+    orchestrator_call("spawn_dev_agent", args)
+}
+
+fn instruct_dev_agent(args: &Value) -> Result<Value> {
+    orchestrator_call("instruct_dev_agent", args)
+}
+
+fn list_dev_agents(args: &Value) -> Result<Value> {
+    orchestrator_call("list_dev_agents", args)
+}
+
+fn get_agent_status(args: &Value) -> Result<Value> {
+    orchestrator_call("get_agent_status", args)
+}
+
+fn stop_dev_agent(args: &Value) -> Result<Value> {
+    orchestrator_call("stop_dev_agent", args)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

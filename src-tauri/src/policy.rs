@@ -180,6 +180,51 @@ fn default_denied_commands() -> Vec<String> {
     .collect()
 }
 
+/// HARD protected-paths rule (always on, every mode, not config-overridable).
+/// This project (Jarvis) is for the user's PERSONAL work only — it must never
+/// read, write, or run against the user's protected files. We block anything
+/// whose path args OR (for `run_shell`) command text references a forbidden
+/// marker.
+/// Markers are supplied via `JARVIS_PROTECTED_PATHS` (comma-separated); there are
+/// no built-in names.
+fn protected_path_guard(tool: &str, args: &Value) -> Option<String> {
+    let mut needles: Vec<String> = Vec::new();
+    if let Ok(extra) = std::env::var("JARVIS_PROTECTED_PATHS") {
+        needles.extend(
+            extra
+                .split(',')
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty()),
+        );
+    }
+
+    let mut hay: Vec<String> = Vec::new();
+    for key in ["path", "workdir", "dir", "app_name", "project_dir"] {
+        if let Some(v) = arg_str(args, key) {
+            hay.push(v);
+        }
+    }
+    if let Some(arr) = args.get("paths").and_then(|v| v.as_array()) {
+        hay.extend(arr.iter().filter_map(|v| v.as_str().map(String::from)));
+    }
+    if tool == "run_shell" {
+        if let Some(c) = arg_str(args, "command") {
+            hay.push(c);
+        }
+    }
+
+    for h in &hay {
+        let lc = h.to_lowercase();
+        if let Some(n) = needles.iter().find(|n| lc.contains(n.as_str())) {
+            return Some(format!(
+                "Refused: this project must never touch protected files (matched \"{n}\"). \
+                 That is a hard rule in every mode — use a separate Claude Code session for those."
+            ));
+        }
+    }
+    None
+}
+
 static GLOBAL: OnceLock<Policy> = OnceLock::new();
 
 /// The active policy. Falls back to `Policy::default()` if `init` was never
@@ -261,6 +306,15 @@ impl Policy {
         args: &Value,
         tainted: bool,
     ) -> Decision {
+        // 0) PROTECTED-PATHS HARD RULE — this project must NEVER touch the
+        //    user's protected files, in ANY mode (not even dev), and this
+        //    cannot be softened or disabled via config. Jarvis is used on
+        //    personal work only; that work uses a separate Claude Code
+        //    session. See `protected_path_guard`.
+        if let Some(reason) = protected_path_guard(tool, args) {
+            return Decision::Deny { reason };
+        }
+
         // 1) Hard denials, evaluated before mode. In dev these soften to a
         //    confirm so the owner is never fully blocked, just slowed down.
         if let Some(reason) = self.app_hard_denied(args) {
@@ -431,6 +485,12 @@ pub fn describe(tool: &str, args: &Value) -> String {
         }
         "send_shortcut" | "press_key" => arg_str(args, "key").map(|k| format!("press {k}")),
         "create_calendar_event" => arg_str(args, "summary").map(|s| format!("add calendar event: {s}")),
+        "spawn_dev_agent" => arg_str(args, "task").map(|t| format!("spawn dev agent: {}", clip(&t, 100))),
+        "instruct_dev_agent" => arg_str(args, "instruction").map(|i| {
+            let who = arg_str(args, "agent_id").unwrap_or_else(|| "agent".into());
+            format!("instruct {who}: {}", clip(&i, 80))
+        }),
+        "stop_dev_agent" => arg_str(args, "agent_id").map(|a| format!("stop dev agent {a}")),
         _ => None,
     };
     detail.unwrap_or_else(|| tool.replace('_', " "))
@@ -608,6 +668,38 @@ mod tests {
         p.mode = Mode::Dev;
         assert!(matches!(
             p.decide("run_shell", DangerLevel::Destructive, &json!({"command":"ls"}), true),
+            Decision::Allow
+        ));
+    }
+
+    #[test]
+    fn protected_paths_hard_denied_even_in_dev() {
+        // No built-in names: supply the markers this test exercises.
+        std::env::set_var("JARVIS_PROTECTED_PATHS", "private-code,private-projects");
+        let mut p = Policy::default();
+        p.mode = Mode::Dev; // the most permissive mode — must STILL deny.
+        // read_file under private-projects
+        assert!(matches!(
+            p.decide("read_file", DangerLevel::ReadOnly,
+                     &json!({"path": "~/private-projects/secret/Main.java"}), false),
+            Decision::Deny { .. }
+        ));
+        // a run_shell command that references a private-code path
+        assert!(matches!(
+            p.decide("run_shell", DangerLevel::Destructive,
+                     &json!({"command": "cat ~/dev/private-code-frontend/.env"}), false),
+            Decision::Deny { .. }
+        ));
+        // write_file into a private-code dir
+        assert!(matches!(
+            p.decide("write_file", DangerLevel::Destructive,
+                     &json!({"path": "/Users/x/work/private-code/app.ts", "content": "x"}), false),
+            Decision::Deny { .. }
+        ));
+        // a normal personal path is unaffected
+        assert!(matches!(
+            p.decide("read_file", DangerLevel::ReadOnly,
+                     &json!({"path": "~/claude/jarvis-workspace/projects/site/index.html"}), false),
             Decision::Allow
         ));
     }

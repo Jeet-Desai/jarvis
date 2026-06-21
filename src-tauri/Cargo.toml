@@ -41,10 +41,26 @@ webrtc-vad = "0.4"
 # brain/ollama.rs can build precompiled patterns instead of string-matching.
 regex = "1"
 base64 = "0.22"
-# MCP client — talks to external tool servers (e.g. @cocal/google-calendar-mcp)
-# over stdio. Optional at runtime — only spawns if user configures credentials.
+# MCP — both directions:
+#  • CLIENT: talks to external tool servers (e.g. @cocal/google-calendar-mcp and
+#    the dev-agent orchestrator) over stdio.
+#  • SERVER: hosts Jarvis's own tool registry over Streamable HTTP on localhost,
+#    so any MCP-capable agent (Claude Code today; Codex/Kimi later) can be the
+#    "brain" — reason and call Jarvis's gated tools. Both roles live in rmcp 0.8;
+#    no version bump needed (0.8 already ships transport-streamable-http-server).
 # (tokio already declared above with "full" features — covers what rmcp needs.)
-rmcp = { version = "0.8", features = ["client", "transport-child-process"] }
+rmcp = { version = "0.8", features = [
+    "client",
+    "transport-child-process",
+    "server",
+    "transport-streamable-http-server",
+] }
+# axum: HTTP host for the localhost MCP server (mounts rmcp's StreamableHttpService
+# as a tower Service; provides the bearer-token + Origin auth middleware).
+axum = "0.8"
+# getrandom: cross-platform CSPRNG (BCryptGenRandom/getentropy/getrandom) for the
+# per-launch MCP bearer token. Already in the tree transitively; pulled to root.
+getrandom = "0.2"
 # enigo: cross-platform synthetic mouse/keyboard input (macOS CGEvent, Windows
 # SendInput, Linux X11). The single anchor that makes JARVIS 2.0's computer
 # control portable. On macOS it posts CGEvents — needs the Accessibility TCC

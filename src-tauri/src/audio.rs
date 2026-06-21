@@ -78,6 +78,12 @@ struct PipeInner {
     /// the barge-in detector and fires `jarvis:barge_in` if the user
     /// starts talking over Jarvis.
     is_speaking_mode: AtomicBool,
+    /// True while Jarvis's TTS is playing (+ a short drain tail). While true
+    /// the callback goes "deaf": it still emits the level meter but does NOT
+    /// feed the wake/rolling buffer, record, or run VAD — so Jarvis can never
+    /// transcribe its own voice and reply to itself. This is the echo guard
+    /// that replaces the disabled acoustic barge-in until real AEC ships.
+    mic_suppressed: AtomicBool,
     buffer:       Mutex<Vec<f32>>,
     vad:          Mutex<VadTracker>,
     barge_in:     Mutex<BargeInDetector>,
@@ -296,6 +302,7 @@ pub fn start_pipe(app: AppHandle) -> Result<AudioPipe> {
     let inner = Arc::new(PipeInner {
         is_recording:     AtomicBool::new(false),
         is_speaking_mode: AtomicBool::new(false),
+        mic_suppressed:   AtomicBool::new(false),
         buffer:           Mutex::new(Vec::with_capacity(48_000 * 30)),
         vad:              Mutex::new(VadTracker::default()),
         barge_in:         Mutex::new(BargeInDetector::default()),
@@ -344,22 +351,28 @@ pub fn start_pipe(app: AppHandle) -> Result<AudioPipe> {
                 let lvl = rms_f32(&samples);
                 let _ = app.emit("jarvis:level", lvl);
 
-                // Always push into the rolling buffer (for wake detection)
-                {
-                    let mut roll = inner_for_thread.rolling.lock();
-                    for &s in &samples { roll.push_back(s); }
-                    while roll.len() > rolling_max {
-                        roll.pop_front();
+                // While Jarvis is speaking, the mic is "deaf": skip the wake
+                // buffer, recording, and VAD so we can't hear our own TTS and
+                // reply to ourselves. The level meter (emitted above) still
+                // animates the orb.
+                if !inner_for_thread.mic_suppressed.load(Ordering::Acquire) {
+                    // Always push into the rolling buffer (for wake detection)
+                    {
+                        let mut roll = inner_for_thread.rolling.lock();
+                        for &s in &samples { roll.push_back(s); }
+                        while roll.len() > rolling_max {
+                            roll.pop_front();
+                        }
                     }
-                }
 
-                // Buffer for active recording if state machine asked
-                let recording = inner_for_thread.is_recording.load(Ordering::Acquire);
-                if recording {
-                    inner_for_thread.buffer.lock().extend(samples.iter().copied());
-                    if inner_for_thread.vad.lock().process_samples(&samples, sample_rate) {
-                        tracing::info!("vad: end-of-utterance");
-                        let _ = app.emit("jarvis:vad_stop", ());
+                    // Buffer for active recording if state machine asked
+                    let recording = inner_for_thread.is_recording.load(Ordering::Acquire);
+                    if recording {
+                        inner_for_thread.buffer.lock().extend(samples.iter().copied());
+                        if inner_for_thread.vad.lock().process_samples(&samples, sample_rate) {
+                            tracing::info!("vad: end-of-utterance");
+                            let _ = app.emit("jarvis:vad_stop", ());
+                        }
                     }
                 }
 
@@ -481,6 +494,19 @@ impl AudioPipe {
     pub fn stop_speaking_mode(&self) {
         self.inner.is_speaking_mode.store(false, Ordering::Release);
         self.inner.barge_in.lock().stop();
+    }
+
+    /// Mute/unmute the mic for capture while Jarvis speaks. While suppressed the
+    /// callback keeps emitting the level meter but stops feeding the wake
+    /// buffer / recording / VAD — the echo guard against self-listening. Either
+    /// way we wipe the rolling buffer (and reset the VAD on release) so no
+    /// residual TTS echo seeds the next utterance.
+    pub fn set_mic_suppressed(&self, on: bool) {
+        self.inner.mic_suppressed.store(on, Ordering::Release);
+        self.inner.rolling.lock().clear();
+        if !on {
+            self.inner.vad.lock().reset();
+        }
     }
 }
 

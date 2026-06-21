@@ -8,6 +8,7 @@ mod brain;
 mod control;
 mod gate;
 mod mcp;
+mod mcp_server;
 #[cfg(target_os = "macos")]
 mod permissions;
 mod policy;
@@ -88,6 +89,76 @@ fn jarvis_resolve_confirm(id: u64, approved: bool) {
 #[tauri::command]
 fn jarvis_policy_mode() -> String {
     policy::global().mode.as_str().to_string()
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Dev-agent orchestrator helpers (Phase 1.2/1.3)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Where the Python orchestrator sidecar lives. Override with
+/// JARVIS_ORCHESTRATOR_DIR; otherwise the in-repo `orchestrator/` beside
+/// src-tauri (resolved from CARGO_MANIFEST_DIR, same trick as the .env loader).
+fn orchestrator_dir() -> String {
+    if let Ok(d) = std::env::var("JARVIS_ORCHESTRATOR_DIR") {
+        if !d.trim().is_empty() {
+            return d;
+        }
+    }
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(|p| p.join("orchestrator"))
+        .unwrap_or_else(|| "orchestrator".into())
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Normalize the orchestrator's `list_dev_agents` reply into a plain JSON array
+/// of agent summaries for the HUD.
+///
+/// Shape gotcha: FastMCP serializes a Python `list` return as ONE text content
+/// block PER element, which our MCP layer (`extract_text_content`) then joins
+/// with newlines — so a 2-agent reply arrives as `{ "text": "{..}\n{..}" }`,
+/// which is NOT valid single JSON. We therefore parse a *stream* of top-level
+/// JSON values, not one. We also tolerate a clean array, a `{result|agents:[…]}`
+/// envelope, and a single agent object. Anything else → empty array.
+fn extract_agent_list(v: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    if let Some(t) = v.get("text").and_then(|t| t.as_str()) {
+        // Try a clean single parse first (covers a real JSON array / object).
+        if let Ok(val) = serde_json::from_str::<Value>(t) {
+            return normalize_agent_value(val);
+        }
+        // Fall back: several concatenated JSON objects ("{..}\n{..}").
+        let items: Vec<Value> = serde_json::Deserializer::from_str(t)
+            .into_iter::<Value>()
+            .filter_map(Result::ok)
+            .collect();
+        return Value::Array(items);
+    }
+    normalize_agent_value(v.clone())
+}
+
+/// Coerce one parsed value into an array of agent summaries.
+fn normalize_agent_value(val: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match val {
+        Value::Array(_) => val,
+        Value::Object(ref o) => {
+            for key in ["result", "agents"] {
+                if let Some(Value::Array(a)) = o.get(key) {
+                    return Value::Array(a.clone());
+                }
+            }
+            // A lone agent summary (has id+status) → wrap it; an envelope
+            // (e.g. a CallToolResult) we don't recognize → empty.
+            if o.contains_key("id") && o.contains_key("status") {
+                Value::Array(vec![val])
+            } else {
+                Value::Array(vec![])
+            }
+        }
+        _ => Value::Array(vec![]),
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -455,7 +526,16 @@ pub fn run() {
                 }
             }
 
-            // Build the pluggable LLM brain (Gemini / OpenAI-compat / Ollama)
+            // Host Jarvis's own tools as an MCP server on localhost so an agent
+            // (Claude Code on the user's subscription) can be the brain and call
+            // them through the same safety gate. Non-fatal — if it can't bind,
+            // the agent brain just won't have an endpoint and the brain falls
+            // back to the API providers below.
+            if let Err(e) = mcp_server::start() {
+                tracing::warn!("mcp_server: {e}");
+            }
+
+            // Build the pluggable LLM brain (agent-driver / Gemini / OpenAI / Ollama)
             match brain::Brain::from_env() {
                 Ok(brain) => {
                     app_state.init_brain(Arc::new(brain));
@@ -479,6 +559,34 @@ pub fn run() {
                                 tracing::warn!("mcp[calendar]: {e}");
                             }
                         }
+                    }
+
+                    // Dev-agent orchestrator sidecar. Look it up via
+                    // JARVIS_ORCHESTRATOR_DIR, else assume the in-repo
+                    // `orchestrator/` next to src-tauri. Non-fatal: if the venv
+                    // isn't set up the dev-agent tools just report a setup hint.
+                    let orch_dir = orchestrator_dir();
+                    if let Err(e) = manager.init_orchestrator(&orch_dir) {
+                        tracing::warn!("mcp[orchestrator]: {e}");
+                    } else {
+                        // Background poll: push the live agent roster to the HUD
+                        // "AGENTS" panel every ~2s. Lives on its own thread and
+                        // calls the sidecar directly (NOT through tools::dispatch),
+                        // so it never enters the activity feed or takes the
+                        // conversation lock.
+                        let poll_mgr = manager.clone();
+                        std::thread::spawn(move || {
+                            loop {
+                                std::thread::sleep(std::time::Duration::from_secs(2));
+                                if !poll_mgr.orchestrator_ready() {
+                                    continue;
+                                }
+                                match poll_mgr.orchestrator_call("list_dev_agents", serde_json::json!({})) {
+                                    Ok(v) => gate::emit_agents(extract_agent_list(&v)),
+                                    Err(e) => tracing::debug!("mcp[orchestrator]: poll failed: {e}"),
+                                }
+                            }
+                        });
                     }
                 }
                 Err(e) => tracing::warn!("mcp: failed to start manager: {e}"),

@@ -119,6 +119,22 @@
 }
 .hud-activity-panel::-webkit-scrollbar { width: 0; }
 
+/* ────────── agents roster panel (right, mirrors activity feed) ────────── */
+.hud-agents-panel {
+  position: absolute;
+  top: 150px;
+  right: 80px;
+  width: 260px;
+  max-height: 46vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: auto;
+}
+.hud-agents-panel::-webkit-scrollbar { width: 0; }
+.hud-agents-panel > .hud-panel-label { text-align: right; }
+
 /* ────────── center orb ────────── */
 .hud-orb-wrap {
   position: absolute;
