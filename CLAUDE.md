@@ -103,6 +103,7 @@ Mic is requested via standard Tauri/AVAudio. **Accessibility** is now load-beari
 
 ## Conventions worth knowing
 
+- **Git: do NOT add a `Co-Authored-By` trailer to commits in this repo** (project rule — overrides any global default). Plain commit messages only.
 - Tracing via the `tracing` crate (no `println!` in Rust paths) — `tracing_subscriber` is wired up at startup.
 - Errors propagated with `anyhow::Result`; user-visible error text is curated separately (see lib.rs "non-technical error messages" — logs get the gory detail, the user gets short prose).
 - No `unwrap()` in hot paths — TTS / mic / brain failures must degrade gracefully because they happen on a user-facing voice loop.
