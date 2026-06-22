@@ -216,6 +216,23 @@ pub fn registry() -> Vec<Tool> {
             handler: stop_dev_agent,
         },
         Tool {
+            name: "qa_web_app",
+            declaration: json!({
+                "name": "qa_web_app",
+                "description": "Visually QA a web app a dev agent built: serve it on a local port, screenshot it at mobile + desktop, and judge it against the user's spec with Claude vision. Use when the user says 'check the landing page against my spec', 'does the site look right', 'QA the agent's work', 'how does it look', 'is it done'. Pass `target` = the agent_id (from spawn_dev_agent / list_dev_agents) whose work to check, OR an absolute path to the web app's project directory. Returns a PASS / NEEDS_WORK / FAIL verdict, per-criterion scores, the top issues to fix, a spoken-friendly summary, and the screenshot paths. READ-ONLY: it only serves and screenshots — it does not modify the project.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "target": { "type": "string", "description": "The agent_id whose worktree to QA (from spawn_dev_agent / list_dev_agents), OR an absolute path to the web app's project directory / worktree." },
+                        "spec":   { "type": "string", "description": "What the app SHOULD look like and do, in plain language — the design brief / acceptance criteria the page is judged against. Be specific (sections, layout, copy, colors, responsiveness)." }
+                    },
+                    "required": ["target", "spec"]
+                }
+            }),
+            danger: DangerLevel::ReadOnly,
+            handler: qa_web_app,
+        },
+        Tool {
             name: "type_text",
             declaration: json!({
                 "name": "type_text",
@@ -744,6 +761,14 @@ fn get_agent_status(args: &Value) -> Result<Value> {
 
 fn stop_dev_agent(args: &Value) -> Result<Value> {
     orchestrator_call("stop_dev_agent", args)
+}
+
+// Visual QA: serve + screenshot + Claude-judge a built web app (orchestrator/qa.py).
+// Read-only (serves + screenshots), so it's gated as ReadOnly — runs silently in
+// every policy mode. The QA run can take a while (serve + two captures + the judge),
+// so it leans on the orchestrator_call timeout; a static landing page is well within it.
+fn qa_web_app(args: &Value) -> Result<Value> {
+    orchestrator_call("qa_web_app", args)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

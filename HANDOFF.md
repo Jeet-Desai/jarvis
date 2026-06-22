@@ -38,9 +38,12 @@ Both slices implemented behind the unchanged tool surface and **verified in the 
 [`docs/P3-research.md`](docs/P3-research.md) (4 web-research reports: visual-QA pipeline,
 computer-use reliability, building blocks, voice-UX landscape). TL;DR:
 - **QA loop lives in the Python sidecar** (`orchestrator/qa.py`, NEW — exists now); Rust stays voice/gate/UI.
-- **Builder** = dev agent on the Claude subscription; **Judge** = direct **Gemini** multimodal call
-  from Python (free, off-subscription — it runs every iteration). Rubric-based structured verdict.
-- Phases: ~~spike~~ ✅ → **P3a** one-shot `qa_web_app` tool (serve→screenshot→judge) → **P3b** the loop
+- **Builder** = dev agent on the Claude subscription; **Judge** = **Claude (sonnet)** via `claude-agent-sdk`,
+  on the SAME Claude subscription (user decision 2026-06-22 — overrides the original "Gemini, free,
+  off-subscription" plan; they want one consistent tool, accept the per-iteration sub cost). Rubric-based
+  structured verdict. ⚠️ cost: judge runs every iteration on the shared usage window — keep the loop's
+  `max_iters` tight in P3b.
+- Phases: ~~spike~~ ✅ → ~~**P3a** one-shot `qa_web_app` tool (serve→screenshot→judge)~~ ✅ → **P3b** the loop
   (judge fails → `instruct_dev_agent` → re-serve → re-judge; stop conditions; **proactive voice
   narrates verdicts**, riding the P2 announcer) → **P3c** add build/tsc/lint/test gates.
 - Defer `can_use_tool`→gate per-action gating to P4 (P3 keeps gating at spawn time).
@@ -61,20 +64,32 @@ computer-use reliability, building blocks, voice-UX landscape). TL;DR:
   intersecting immediately (deterministic "fully-scrolled" state) + `_REDUCE_MOTION_CSS` for crisp
   capture. Now `3/3` every run. **Keep this when extending capture()** — any reveal-on-scroll app hits it.
 
-### P3a — the immediate next step (free: Gemini judge + tool wiring, no agent spawn)
-1. **`judge(spec, shots, console_errors) -> {verdict, scores, fixes[]}`** in `qa.py` — ONE Gemini
-   multimodal REST call (`GEMINI_API_KEY` is set in `.env`), both screenshots in one request.
-   Mirror `src-tauri/src/brain/vision.rs`'s Gemini path. Anti-hallucination contract: force a rubric
-   (layout/typography/color/responsiveness/spec-adherence 1–5), `PASS|NEEDS_WORK|FAIL` BEFORE prose,
-   numbered fix list, spec text in the prompt. No numeric scores = failed judge → retry stricter.
-2. **`qa_web_app(project_dir_or_agent_id, spec)`** — add to `orchestrator/server.py` (FastMCP `@mcp.tool`)
-   calling a new `manager.py` method that resolves an agent_id→its worktree (or takes a path), then
-   `with serve_app(wt) as url: capture()→judge()`. Returns spoken-friendly verdict + top issues + shot path.
-3. **Register `qa_web_app` in `src-tauri/src/tools.rs`** `registry()` with `DangerLevel::ReadOnly`
-   (it only serves+reads); `mcp.rs` already forwards external MCP tools by name. Then `cargo check`.
-- **Done when:** "Jarvis, check the landing page against my spec" → spoken pass/fail + top issues,
-  screenshot path in the activity feed. Test the judge for FREE against the existing landing-page shots.
-- **Then handoff before P3b** (P3b spawns dev agents = subscription cost; ASK the user first).
+### ✅ P3a DONE + LIVE-VERIFIED (2026-06-22) — judge runs on **Claude**, not Gemini
+All three slices shipped behind the unchanged tool surface; the Claude judge was live-tested against
+the on-disk `/tmp/jarvis-qa-fixed` shots (one sonnet call each for a matching spec → PASS and a
+deliberately-mismatched dashboard spec → FAIL, spec_adherence=1; it quoted the real hero copy, proving
+it grounds in the pixels). **Working tree is uncommitted — commit when the user asks.**
+1. **`judge(spec, shots, console_errors, page_errors) -> {verdict, scores, fixes[], summary, model, raw}`**
+   in `qa.py` — a ONE-SHOT, **tool-less** `claude-agent-sdk` `query()` (model `sonnet`, override
+   `JARVIS_QA_JUDGE_MODEL`). Both screenshots go in as **inline image blocks**; `allowed_tools=[]` +
+   `setting_sources=[]` keep it sandboxed (no Read/file/web). Anti-hallucination contract kept: rubric
+   (layout/typography/color/responsiveness/spec_adherence 1–5), `PASS|NEEDS_WORK|FAIL`, numbered fixes,
+   spec in the prompt; no numeric scores = failed judge → one stricter retry, else raise.
+   ⚠️ **GOTCHA (cost us a failed run):** Claude Code wants the **Anthropic-native image block** —
+   `{"type":"image","source":{"type":"base64","media_type":"image/png","data":…}}` — NOT the flat
+   `{data,mimeType}` form some SDK docs show (that fails inside Claude Code with
+   `undefined is not an object (evaluating 'e.source.type')`). See `_image_blocks()`.
+2. **`qa_web_app(target, spec)`** — `server.py` FastMCP tool → `manager.qa_web_app()`, which resolves
+   `target` (agent_id → its worktree, live OR detached; else a path; protected-paths guard) then
+   `with serve_app(wt) as url: capture()→judge()`. Returns `{verdict, scores, spoken, top_issues, fixes,
+   screenshots, shot_dir, console_errors, …}` — `spoken` is the TTS one-liner.
+3. **`qa_web_app` registered in `tools.rs`** as `DangerLevel::ReadOnly`; `mcp.rs` forwards by name and
+   gives this one tool a **180s** timeout (serve+2 captures+judge is heavier than a spawn). `cargo check` clean.
+- **Still needs a LIVE in-app run (user's manual step):** `pnpm install:app`, spawn a dev agent that builds
+  a web app, then "Jarvis, check the landing page against my spec" → confirm spoken pass/fail + top issues
+  and the screenshot path show in the activity feed. (Will prompt to launch Playwright's headless shell — a
+  browser → the standing "ask before any browser" rule applies; it's invisible but still ask.)
+- **Then P3b** (the closed loop) **spawns dev agents = subscription cost — ASK the user first.**
 
 ## Then (backlog, prioritized)
 - **P4 — structured actuation:** adopt **Playwright MCP** (spawn like the calendar MCP); reorder

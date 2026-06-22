@@ -53,5 +53,18 @@ async def stop_dev_agent(agent_id: str, remove_worktree: bool = False) -> dict:
     return await manager.stop(agent_id, remove_worktree)
 
 
+@mcp.tool()
+async def qa_web_app(target: str, spec: str) -> dict:
+    """Visually QA a web app against a spec. Serves the app on an ephemeral local
+    port, screenshots it at mobile + desktop, and judges it against `spec` with
+    Claude vision. `target` is an agent_id (from spawn_dev_agent / list_dev_agents)
+    whose worktree to check, OR an absolute path to the web app's project directory.
+    Returns a PASS/NEEDS_WORK/FAIL verdict, per-criterion scores (layout, typography,
+    color, responsiveness, spec_adherence), the top issues to fix, a spoken-friendly
+    summary, and the screenshot paths. Read-only: it serves + screenshots, never
+    modifies the project."""
+    return await manager.qa_web_app(target, spec)
+
+
 if __name__ == "__main__":
     mcp.run()  # stdio transport by default

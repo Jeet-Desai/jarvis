@@ -187,6 +187,9 @@ impl McpManager {
     /// Call a tool on the orchestrator sidecar. Blocks until reply received.
     /// A generous 60s timeout: `spawn_dev_agent` does a `git worktree add` plus
     /// an SDK `connect()` before returning, which can take a while on first use.
+    /// `qa_web_app` is heavier still — it serves the app, takes two Playwright
+    /// screenshots, and runs a Claude vision judge — so it gets a longer budget.
+    /// (P3b moves QA to an async task so it won't block the brain thread at all.)
     pub fn orchestrator_call(&self, tool_name: &str, args: Value) -> Result<Value> {
         let peer = self
             .orchestrator
@@ -200,10 +203,11 @@ impl McpManager {
             .clone();
         let args_map = args.as_object().cloned();
         let tool_name = tool_name.to_string();
+        let timeout_secs: u64 = if tool_name == "qa_web_app" { 180 } else { 60 };
 
         let result = self.runtime.block_on(async move {
             tokio::time::timeout(
-                std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(timeout_secs),
                 peer.call_tool(CallToolRequestParam {
                     name: tool_name.into(),
                     arguments: args_map,
@@ -215,7 +219,7 @@ impl McpManager {
         match result {
             Ok(Ok(r)) => Ok(extract_text_content(&r)),
             Ok(Err(e)) => Err(e.into()),
-            Err(_) => bail!("Orchestrator call timed out after 60s — the sidecar may be stuck"),
+            Err(_) => bail!("Orchestrator call timed out after {timeout_secs}s — the sidecar may be stuck"),
         }
     }
 }

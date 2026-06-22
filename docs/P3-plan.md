@@ -114,9 +114,13 @@ failures that are logic, not looks.
 | Browser | **adopt** Playwright (Python) + later **Playwright MCP** | `serve/capture/qa.py` |
 
 ## 5. Decisions to confirm (with my recommendation)
-1. **Judge vision path** → **Gemini-from-Python** (free, off-subscription, runs every
-   iteration). *Recommended.* Alt: `claude`-CLI judge (best quality, but subscription draw
-   per iteration — reserve for an opt-in "strict" mode).
+1. **Judge vision path** → ~~**Gemini-from-Python** (free, off-subscription)~~ **DECIDED 2026-06-22:
+   Claude (sonnet) via `claude-agent-sdk`**, on the Claude subscription. The user chose one consistent
+   tool (Claude is now primary) over the free Gemini split, accepting the per-iteration subscription
+   cost. Implemented in
+   `qa.py::judge` (tool-less one-shot, inline image blocks). Mitigate cost with a tight P3b `max_iters`;
+   `JARVIS_QA_JUDGE_MODEL` can raise/lower the model. (In testing, sonnet grounded better than
+   gemini-2.5-flash — it quoted real on-page copy.)
 2. **P3 v1 scope** → **web apps only** (cleanest serve+DOM story). Native-app QA later.
 3. **Budgets** → default `max_iters=3`, a wall-clock cap, and announce when truncated
    (never silently give up).

@@ -41,6 +41,11 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
+# Closed-loop visual QA (P3): serve a built web app, screenshot it, judge it against
+# a spec with Claude. qa.py is import-light at module load (playwright + the SDK are
+# imported lazily inside its functions), so this top-level import is cheap.
+from qa import serve_app, capture, judge
+
 def _inside_git_repo(d: Path) -> bool:
     """True if d or any ancestor contains a .git (i.e. d is inside a git repo)."""
     return any((p / ".git").exists() for p in (d, *d.parents))
@@ -167,6 +172,48 @@ def _tool_brief(block: ToolUseBlock) -> str:
         if k in inp:
             return f"{name}({k}={str(inp[k])[:80]})"
     return name
+
+
+def _spoken_verdict(name: str, verdict: dict, cap: dict) -> str:
+    """A short, TTS-friendly sentence for the QA verdict — what Jarvis says aloud."""
+    v = verdict.get("verdict", "NEEDS_WORK")
+    fixes = verdict.get("fixes") or []
+    errs = list(cap.get("console_errors") or []) + list(cap.get("page_errors") or [])
+    if v == "PASS":
+        s = f"{name} passes visual QA against your spec."
+        if fixes:
+            s += f" One thing you could still polish: {fixes[0]}"
+        return s
+    head = "needs some work" if v == "NEEDS_WORK" else "fails visual QA"
+    s = f"{name} {head}."
+    if fixes:
+        s += f" Top issue: {fixes[0]}"
+        if len(fixes) > 1:
+            s += f" {len(fixes)} issues in total."
+    if errs:
+        s += f" I also caught {len(errs)} console error{'s' if len(errs) != 1 else ''}."
+    return s
+
+
+def _qa_result(worktree: Path, cap: dict, verdict: dict) -> dict:
+    """Assemble the spoken-friendly QA result the brain returns to the user. Kept
+    compact (no base64, no raw judge text) since it flows back into the LLM context;
+    full screenshots live on disk at `shot_dir`."""
+    fixes = verdict.get("fixes") or []
+    return {
+        "verdict": verdict.get("verdict"),
+        "scores": verdict.get("scores", {}),
+        "summary": verdict.get("summary", ""),
+        "spoken": _spoken_verdict(worktree.name, verdict, cap),
+        "top_issues": fixes[:3],
+        "fixes": fixes,
+        "screenshots": [s["path"] for s in cap.get("shots", [])],
+        "shot_dir": cap.get("out_dir"),
+        "console_errors": cap.get("console_errors", []),
+        "page_errors": cap.get("page_errors", []),
+        "target": str(worktree),
+        "judge_model": verdict.get("model"),
+    }
 
 
 @dataclass
@@ -359,6 +406,53 @@ class AgentManager:
             _run(["git", "worktree", "remove", "--force", str(agent.worktree)],
                  cwd=agent.project_dir)
         return agent.summary()
+
+    # ── closed-loop visual QA (P3) ───────────────────────────────────────────
+
+    def _resolve_qa_worktree(self, target: str) -> Path:
+        """Resolve a qa_web_app `target` to a directory to serve. `target` is either
+        a known agent_id (live OR detached → its worktree) or a filesystem path. The
+        protected-paths hard rule applies, same as spawn."""
+        raw = (target or "").strip()
+        if not raw:
+            raise ValueError("qa_web_app needs an agent_id or a project directory path")
+        _assert_not_protected(raw)
+        if raw in self.agents:
+            wt = Path(self.agents[raw].worktree)
+        elif raw in self.registry and self.registry[raw].get("worktree"):
+            wt = Path(self.registry[raw]["worktree"])
+        else:
+            wt = Path(raw).expanduser()
+        wt = wt.resolve()
+        _assert_not_protected(str(wt))
+        if not wt.is_dir():
+            raise FileNotFoundError(
+                f"QA target not found (not a known agent_id, and not a directory): {wt}"
+            )
+        return wt
+
+    async def qa_web_app(self, target: str, spec: str, build: bool = True) -> dict:
+        """Visually QA a web app a dev agent built: serve it on an ephemeral local
+        port, screenshot it at mobile + desktop, and judge it against `spec` with
+        Claude. `target` is an agent_id or a project-dir path. Returns a
+        spoken-friendly PASS/NEEDS_WORK/FAIL verdict with scores, top issues, and the
+        screenshot paths. Read-only: it only serves + screenshots, never modifies."""
+        worktree = self._resolve_qa_worktree(target)
+        log.info("[qa] START     | target=%s worktree=%s spec=%.80s",
+                 target, worktree, " ".join((spec or "").split()))
+        try:
+            with serve_app(worktree, build=build) as url:
+                cap = await capture(url, spec)
+                verdict = await judge(
+                    spec, cap["shots"], cap.get("console_errors"), cap.get("page_errors")
+                )
+        except Exception as e:  # noqa: BLE001 - surface a readable error to the brain
+            log.warning("[qa] ERROR     | target=%s: %r", target, e)
+            raise
+        result = _qa_result(worktree, cap, verdict)
+        log.info("[qa] DONE      | verdict=%s scores=%s shots=%s",
+                 result["verdict"], result["scores"], result["shot_dir"])
+        return result
 
     # ── reads (sync; cheap control-plane queries) ────────────────────────────
 
