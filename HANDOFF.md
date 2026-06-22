@@ -33,19 +33,48 @@ Both slices implemented behind the unchanged tool surface and **verified in the 
 - Restart the app with a past agent in the registry → confirm the AGENTS panel still lists it (detached) and "how's the agent doing?" answers from history.
 - Watch races: trigger a wake word / ⌘⇧J at the exact moment an announcement starts — a user turn must always win.
 
-## ⏭️ NEXT — P3: closed-loop visual QA (PLAN WRITTEN — start here)
+## ⏭️ NEXT — P3: closed-loop visual QA (IN PROGRESS — spike DONE, P3a next)
 **Read [`docs/P3-plan.md`](docs/P3-plan.md)** (the tailored, phased plan) backed by
 [`docs/P3-research.md`](docs/P3-research.md) (4 web-research reports: visual-QA pipeline,
 computer-use reliability, building blocks, voice-UX landscape). TL;DR:
-- **QA loop lives in the Python sidecar** (`orchestrator/qa.py`, new); Rust stays voice/gate/UI.
+- **QA loop lives in the Python sidecar** (`orchestrator/qa.py`, NEW — exists now); Rust stays voice/gate/UI.
 - **Builder** = dev agent on the Claude subscription; **Judge** = direct **Gemini** multimodal call
   from Python (free, off-subscription — it runs every iteration). Rubric-based structured verdict.
-- Phases: **P3a** one-shot `qa_web_app` tool (serve→screenshot→judge) → **P3b** the loop
+- Phases: ~~spike~~ ✅ → **P3a** one-shot `qa_web_app` tool (serve→screenshot→judge) → **P3b** the loop
   (judge fails → `instruct_dev_agent` → re-serve → re-judge; stop conditions; **proactive voice
   narrates verdicts**, riding the P2 announcer) → **P3c** add build/tsc/lint/test gates.
-- **First move (zero cost):** spike `serve_app()`+`capture()` against the already-built
-  `landing-page-builder` worktree on disk — no agent spawn needed.
 - Defer `can_use_tool`→gate per-action gating to P4 (P3 keeps gating at spawn time).
+
+### ✅ P3 spike DONE (2026-06-22, zero subscription cost)
+`orchestrator/qa.py` ships working `serve_app()` + `capture()`, validated against the on-disk
+`landing-page-builder` worktree (no agent spawn). Deps added: `playwright==1.60.0` + the bundled
+`chrome-headless-shell` (a HEADLESS, isolated-profile binary — **not** the user's Google Chrome;
+⚠️ user rule: ask before launching ANY browser, even headless — it's fine because invisible, but ask).
+- `serve_app(worktree)` — ephemeral port (`socket.bind(:0)`), static (root/dist/build/out/public)
+  + node-build detection, context-managed teardown. Tested via `uv run python qa.py <worktree>`.
+- `capture(url, spec)` — Playwright headless, mobile(375)+desktop(1280) full-page shots; console +
+  pageerror listeners attached BEFORE goto; returns `{shots[], console_errors[], page_errors[], a11y[], out_dir}`.
+- **⚠️ Non-obvious gotcha found + fixed:** scroll-reveal content (`opacity:0 → .is-visible` via
+  `IntersectionObserver`) is INVISIBLE in a naive headless full-page screenshot → a judge would
+  false-flag "missing content". A scroll-pass to trigger it is RACY (proved: desktop `0/3`, mobile
+  `1/3` reveals). Fix in `qa.py`: `_QA_INIT_SCRIPT` overrides `IntersectionObserver` to report
+  intersecting immediately (deterministic "fully-scrolled" state) + `_REDUCE_MOTION_CSS` for crisp
+  capture. Now `3/3` every run. **Keep this when extending capture()** — any reveal-on-scroll app hits it.
+
+### P3a — the immediate next step (free: Gemini judge + tool wiring, no agent spawn)
+1. **`judge(spec, shots, console_errors) -> {verdict, scores, fixes[]}`** in `qa.py` — ONE Gemini
+   multimodal REST call (`GEMINI_API_KEY` is set in `.env`), both screenshots in one request.
+   Mirror `src-tauri/src/brain/vision.rs`'s Gemini path. Anti-hallucination contract: force a rubric
+   (layout/typography/color/responsiveness/spec-adherence 1–5), `PASS|NEEDS_WORK|FAIL` BEFORE prose,
+   numbered fix list, spec text in the prompt. No numeric scores = failed judge → retry stricter.
+2. **`qa_web_app(project_dir_or_agent_id, spec)`** — add to `orchestrator/server.py` (FastMCP `@mcp.tool`)
+   calling a new `manager.py` method that resolves an agent_id→its worktree (or takes a path), then
+   `with serve_app(wt) as url: capture()→judge()`. Returns spoken-friendly verdict + top issues + shot path.
+3. **Register `qa_web_app` in `src-tauri/src/tools.rs`** `registry()` with `DangerLevel::ReadOnly`
+   (it only serves+reads); `mcp.rs` already forwards external MCP tools by name. Then `cargo check`.
+- **Done when:** "Jarvis, check the landing page against my spec" → spoken pass/fail + top issues,
+  screenshot path in the activity feed. Test the judge for FREE against the existing landing-page shots.
+- **Then handoff before P3b** (P3b spawns dev agents = subscription cost; ASK the user first).
 
 ## Then (backlog, prioritized)
 - **P4 — structured actuation:** adopt **Playwright MCP** (spawn like the calendar MCP); reorder
