@@ -33,7 +33,7 @@ Both slices implemented behind the unchanged tool surface and **verified in the 
 - Restart the app with a past agent in the registry → confirm the AGENTS panel still lists it (detached) and "how's the agent doing?" answers from history.
 - Watch races: trigger a wake word / ⌘⇧J at the exact moment an announcement starts — a user turn must always win.
 
-## ⏭️ NEXT — P3: closed-loop visual QA (IN PROGRESS — spike DONE, P3a next)
+## P3 — closed-loop visual QA (spike + P3a DONE; **P3b is the NEXT step, see below ↓**)
 **Read [`docs/P3-plan.md`](docs/P3-plan.md)** (the tailored, phased plan) backed by
 [`docs/P3-research.md`](docs/P3-research.md) (4 web-research reports: visual-QA pipeline,
 computer-use reliability, building blocks, voice-UX landscape). TL;DR:
@@ -85,11 +85,22 @@ it grounds in the pixels). **Working tree is uncommitted — commit when the use
    screenshots, shot_dir, console_errors, …}` — `spoken` is the TTS one-liner.
 3. **`qa_web_app` registered in `tools.rs`** as `DangerLevel::ReadOnly`; `mcp.rs` forwards by name and
    gives this one tool a **180s** timeout (serve+2 captures+judge is heavier than a spawn). `cargo check` clean.
-- **Still needs a LIVE in-app run (user's manual step):** `pnpm install:app`, spawn a dev agent that builds
-  a web app, then "Jarvis, check the landing page against my spec" → confirm spoken pass/fail + top issues
-  and the screenshot path show in the activity feed. (Will prompt to launch Playwright's headless shell — a
-  browser → the standing "ask before any browser" rule applies; it's invisible but still ask.)
-- **Then P3b** (the closed loop) **spawns dev agents = subscription cost — ASK the user first.**
+- **✅ LIVE in-app run DONE (2026-06-23):** rebuilt + installed, launched, said "check the landing-page-builder
+  agent's work against this spec…" → brain called `qa_web_app(27586549)` → pipeline ran end-to-end
+  (serve→capture→Claude judge, ~18s) → Jarvis SPOKE the rubric verdict ("NEEDS_WORK… spec_adherence 3").
+- **⚠️ Bug found + fixed in-app (commit `0640d9d`):** the FIRST in-app try, the brain **bypassed `qa_web_app`**
+  and improvised (`list_dev_agents` + `run_shell` cat/ls/open in the user's real browser + `see_screen`). Root
+  cause: no dev-agent/QA section in the system prompt + Rule 1 pulling "this page" toward screen inspection.
+  Fix: `brain/mod.rs` Rule 7a mandates `qa_web_app` for QA-ing a built web app + forbids the cat/open/see_screen
+  workarounds; `manager.py` resolver now also accepts an agent NAME. Re-tested → routes correctly. **This is the
+  load-bearing lesson for P3b: the loop must be SIDECAR-DRIVEN, not brain-driven.**
+
+## ⏭️ NEXT — P3b: the closed self-correcting loop (the hero) — APPROVED, NOT STARTED
+**Read [`docs/P3b-plan.md`](docs/P3b-plan.md)** — a full, staged, cost-disciplined plan (the design is worked
+out: sidecar-driven loop, `turn_done` Event to await agent turns, `announce`/`announce_seq` → proactive voice,
+stop conditions, the Python-first/Rust-last staging, free unit tests before any agent spawn). The user APPROVED
+P3b knowing it spawns/instructs dev agents = **Claude subscription cost**; still ASK before the first real
+agent-spawn validation (Stage 2). Base for the fresh session: `main` @ `0640d9d` (clean).
 
 ## Then (backlog, prioritized)
 - **P4 — structured actuation:** adopt **Playwright MCP** (spawn like the calendar MCP); reorder
