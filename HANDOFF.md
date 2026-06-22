@@ -33,10 +33,26 @@ Both slices implemented behind the unchanged tool surface and **verified in the 
 - Restart the app with a past agent in the registry → confirm the AGENTS panel still lists it (detached) and "how's the agent doing?" answers from history.
 - Watch races: trigger a wake word / ⌘⇧J at the exact moment an announcement starts — a user turn must always win.
 
+## ⏭️ NEXT — P3: closed-loop visual QA (PLAN WRITTEN — start here)
+**Read [`docs/P3-plan.md`](docs/P3-plan.md)** (the tailored, phased plan) backed by
+[`docs/P3-research.md`](docs/P3-research.md) (4 web-research reports: visual-QA pipeline,
+computer-use reliability, building blocks, voice-UX landscape). TL;DR:
+- **QA loop lives in the Python sidecar** (`orchestrator/qa.py`, new); Rust stays voice/gate/UI.
+- **Builder** = dev agent on the Claude subscription; **Judge** = direct **Gemini** multimodal call
+  from Python (free, off-subscription — it runs every iteration). Rubric-based structured verdict.
+- Phases: **P3a** one-shot `qa_web_app` tool (serve→screenshot→judge) → **P3b** the loop
+  (judge fails → `instruct_dev_agent` → re-serve → re-judge; stop conditions; **proactive voice
+  narrates verdicts**, riding the P2 announcer) → **P3c** add build/tsc/lint/test gates.
+- **First move (zero cost):** spike `serve_app()`+`capture()` against the already-built
+  `landing-page-builder` worktree on disk — no agent spawn needed.
+- Defer `can_use_tool`→gate per-action gating to P4 (P3 keeps gating at spawn time).
+
 ## Then (backlog, prioritized)
-- **P3 HERO — closed-loop visual QA** (now reachable): agent builds web app → Jarvis `run_shell` serves it → `see_screen` vision judges vs spec → critique back to agent → repeat.
+- **P4 — structured actuation:** adopt **Playwright MCP** (spawn like the calendar MCP); reorder
+  the system prompt to a waterfall **AX tree → Playwright MCP → OmniParser-grounded vision → raw
+  `locate_on_screen` (last resort)** — retires the pixel-clicking weak spot. Wire `can_use_tool`→gate.
 - Brain polish: persistent `ClaudeSDKClient` session (cut per-turn latency), streaming TTS, ⌘⇧S kills the `claude` subprocess.
-- Weak spot: fine UI clicking via `locate_on_screen` (vision) loops — improve targeting or lean away from pixel-clicking.
+- Plan-confirm-execute voice ritual + codebase-aware STT (resolve "the auth modal" → real file).
 - Windows port = swap `control/` only (architecture already portable).
 
 ## Tip
