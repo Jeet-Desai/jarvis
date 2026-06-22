@@ -409,25 +409,41 @@ class AgentManager:
 
     # ── closed-loop visual QA (P3) ───────────────────────────────────────────
 
+    def _worktree_by_name(self, name: str) -> Optional[Path]:
+        """Find an agent's worktree by its friendly NAME (live agents first, then
+        detached registry). Voice-friendly: when the user says 'QA the
+        landing-page-builder agent', the brain may pass that name rather than the
+        opaque 8-hex id."""
+        key = name.strip().lower()
+        for a in self.agents.values():
+            if a.name.lower() == key:
+                return Path(a.worktree)
+        for r in self.registry.values():
+            if str(r.get("name", "")).lower() == key and r.get("worktree"):
+                return Path(r["worktree"])
+        return None
+
     def _resolve_qa_worktree(self, target: str) -> Path:
-        """Resolve a qa_web_app `target` to a directory to serve. `target` is either
-        a known agent_id (live OR detached → its worktree) or a filesystem path. The
-        protected-paths hard rule applies, same as spawn."""
+        """Resolve a qa_web_app `target` to a directory to serve. `target` may be a
+        known agent_id (live OR detached → its worktree), an agent NAME, or a
+        filesystem path — tried in that order. The protected-paths hard rule
+        applies, same as spawn."""
         raw = (target or "").strip()
         if not raw:
-            raise ValueError("qa_web_app needs an agent_id or a project directory path")
+            raise ValueError("qa_web_app needs an agent_id, agent name, or project directory path")
         _assert_not_protected(raw)
         if raw in self.agents:
-            wt = Path(self.agents[raw].worktree)
+            wt = Path(self.agents[raw].worktree)            # 1) live agent_id
         elif raw in self.registry and self.registry[raw].get("worktree"):
-            wt = Path(self.registry[raw]["worktree"])
+            wt = Path(self.registry[raw]["worktree"])       # 2) detached agent_id
         else:
-            wt = Path(raw).expanduser()
+            by_name = self._worktree_by_name(raw)           # 3) agent name
+            wt = by_name if by_name is not None else Path(raw).expanduser()  # 4) path
         wt = wt.resolve()
         _assert_not_protected(str(wt))
         if not wt.is_dir():
             raise FileNotFoundError(
-                f"QA target not found (not a known agent_id, and not a directory): {wt}"
+                f"QA target not found (not a known agent id/name, and not a directory): {wt}"
             )
         return wt
 
