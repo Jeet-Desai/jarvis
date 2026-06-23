@@ -177,8 +177,10 @@ pub struct Brain {
 
 impl Brain {
     /// Build a Brain by auto-detecting which provider env vars are present.
-    /// Order is taken from `LLM_PROVIDERS=...` if set, otherwise a sensible
-    /// default (Gemini → OpenAI → Ollama).
+    /// `LLM_PROVIDERS=...`, if set, is an ALLOWLIST + order — only the named
+    /// providers run (so `LLM_PROVIDERS=claude-code` = Claude alone, no fallback);
+    /// unset → keep all detected in the default order (agent → Gemini → OpenAI →
+    /// Ollama).
     pub fn from_env() -> Result<Self> {
         let mut detected: Vec<Box<dyn LlmProvider>> = Vec::new();
 
@@ -213,12 +215,42 @@ impl Brain {
             );
         }
 
-        // Optional explicit order
+        // LLM_PROVIDERS, when set, is an ALLOWLIST + order — keep ONLY the named
+        // providers, in that order, and DROP every other detected one. So
+        // `LLM_PROVIDERS=claude-code` runs Claude alone with NO fallback (a slow or
+        // failing primary aborts the turn rather than silently handing off to a
+        // different model — which, with normalized history, otherwise re-does
+        // already-taken side effects like a dev-agent spawn). Unset → keep all
+        // detected in the default order. A list that matches nothing configured is
+        // ignored (keep all detected) so a typo can't leave Jarvis with no brain.
         if let Ok(order) = std::env::var("LLM_PROVIDERS") {
-            let order: Vec<&str> = order.split(',').map(str::trim).collect();
-            detected.sort_by_key(|p| {
-                order.iter().position(|n| *n == p.name()).unwrap_or(usize::MAX)
-            });
+            let order: Vec<String> = order
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !order.is_empty() {
+                let mut kept: Vec<Box<dyn LlmProvider>> = Vec::new();
+                for name in &order {
+                    if let Some(pos) = detected.iter().position(|p| p.name() == name) {
+                        kept.push(detected.remove(pos));
+                    }
+                }
+                if kept.is_empty() {
+                    tracing::warn!(
+                        "brain: LLM_PROVIDERS={order:?} matched no configured provider — keeping all detected"
+                    );
+                } else {
+                    if !detected.is_empty() {
+                        let dropped: Vec<&str> = detected.iter().map(|p| p.name()).collect();
+                        tracing::info!(
+                            "brain: LLM_PROVIDERS allowlist active — dropping fallback providers: {}",
+                            dropped.join(", ")
+                        );
+                    }
+                    detected = kept;
+                }
+            }
         }
 
         let names: Vec<&str> = detected.iter().map(|p| p.name()).collect();
