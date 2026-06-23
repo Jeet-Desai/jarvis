@@ -656,7 +656,31 @@ class AgentManager:
             spoken.append(text)
 
         try:
-            for i in range(1, max_iters + 1):
+            # The brain often fires spawn_dev_agent then start_qa_loop in the SAME
+            # turn, so the agent may still be mid-build with an empty worktree. Wait
+            # for that in-flight build turn to finish before the first QA pass
+            # (mirrors the manual wait used in the Stage-2 validation). Clearing
+            # first means we await THIS turn, not a stale completion; the drain sets
+            # status→idle BEFORE turn_done, so a working status implies the event is
+            # not yet set for the current turn → no lost-wakeup race.
+            if agent.status == "working":
+                self._event(agent, "qa_loop", "waiting for the build to finish before first QA")
+                log.info("[qa-loop] WAIT      | agent=%s waiting for in-flight build turn", agent.id)
+                agent.turn_done.clear()
+                try:
+                    await asyncio.wait_for(agent.turn_done.wait(), turn_timeout)
+                except asyncio.TimeoutError:
+                    say(f"{agent.name} is still building after a while, so I haven't QA'd it yet. "
+                        "Want to take a look?")
+                    stop_reason = "build_timeout"
+            if stop_reason != "build_timeout" and agent.status == "error":
+                say(f"{agent.name} hit an error while building, so there's nothing to QA yet. "
+                    "Want to take a look?")
+                stop_reason = "agent_error"
+
+            # Skip QA entirely if the build never produced anything usable.
+            passes = range(0) if stop_reason in ("build_timeout", "agent_error") else range(1, max_iters + 1)
+            for i in passes:
                 # serve → capture → judge (reuse the P3a one-shot pieces).
                 try:
                     with serve_app(agent.worktree) as url:

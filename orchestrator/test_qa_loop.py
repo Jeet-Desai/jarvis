@@ -238,6 +238,52 @@ async def test_qa_error():
     check("final is None (no usable verdict)", res["final"] is None)
 
 
+async def test_waits_for_build_then_qas():
+    print("\n== start_qa_loop WAITS for an in-flight build before the first QA ==")
+    mgr = AgentManager()
+    agent = make_live_agent(mgr, "builder", complete="ok")
+    agent.status = "working"  # simulate spawn → agent still building (empty worktree)
+    jf, calls = scripted_judge([passing()])
+    patch_qa(jf)
+    loop_task = asyncio.create_task(mgr._qa_fix_loop(agent, "spec", max_iters=2, turn_timeout=5))
+
+    async def finish_build():
+        await asyncio.sleep(0)  # let the loop reach its build-wait
+        agent.status = "idle"
+        agent.turn_done.set()   # the build turn completes (drain would do this)
+
+    await finish_build()
+    res = await loop_task
+    check("loop waited then passed", res["passed"] is True and res["stop_reason"] == "passed")
+    check("exactly one QA pass after the build", res["iterations"] == 1)
+    check("judge ran only after the build", calls["n"] == 1)
+
+
+async def test_build_timeout_skips_qa():
+    print("\n== build never finishes → stop 'build_timeout', QA never runs ==")
+    mgr = AgentManager()
+    agent = make_live_agent(mgr, "slowbuild", complete="hang")
+    agent.status = "working"           # building forever
+    jf, calls = scripted_judge([passing()])
+    patch_qa(jf)
+    res = await mgr._qa_fix_loop(agent, "spec", max_iters=2, turn_timeout=0.05)
+    check("stop_reason == 'build_timeout'", res["stop_reason"] == "build_timeout")
+    check("no QA passes ran", res["iterations"] == 0)
+    check("judge never called", calls["n"] == 0)
+    check("final is None", res["final"] is None)
+
+
+async def test_idle_agent_skips_build_wait():
+    print("\n== an already-idle agent QAs immediately (no build-wait) ==")
+    mgr = AgentManager()
+    agent = make_live_agent(mgr, "ready", complete="ok")
+    agent.status = "idle"              # build already done before the loop
+    jf, calls = scripted_judge([passing()])
+    patch_qa(jf)
+    res = await mgr._qa_fix_loop(agent, "spec", max_iters=2, turn_timeout=5)
+    check("passed on pass 1 with no wait", res["passed"] is True and res["iterations"] == 1)
+
+
 async def test_start_returns_immediately_and_rejects_detached():
     print("\n== start_qa_loop: returns immediately + refuses a detached agent ==")
     mgr = AgentManager()
@@ -318,6 +364,9 @@ async def main() -> int:
     await test_fix_timeout()
     await test_agent_error()
     await test_qa_error()
+    await test_waits_for_build_then_qas()
+    await test_build_timeout_skips_qa()
+    await test_idle_agent_skips_build_wait()
     await test_start_returns_immediately_and_rejects_detached()
     test_helpers()
     print()
