@@ -216,6 +216,96 @@ def _qa_result(worktree: Path, cap: dict, verdict: dict) -> dict:
     }
 
 
+# ── closed self-correcting QA loop (P3b) — pure, unit-testable helpers ─────────
+
+# Jaccard similarity between two consecutive fix-sets at/above which we declare the
+# agent is "stuck" (re-reporting the same problems). 0.8 tolerates rewording while
+# catching genuine no-progress. Override is intentionally NOT exposed — it's a tuned
+# control-flow constant, not a user knob.
+_NO_PROGRESS_SIM = 0.8
+
+# Generic filler stripped from fix text before comparison, so the issue-set similarity
+# keys off the NOUNS (hero, headline, button, contrast, padding) rather than the
+# boilerplate verbs/qualifiers a judge wraps them in. Short words (≤3 chars: "the",
+# "add", "fix", …) are already dropped by length, so this only lists the 4+ char filler.
+_FIX_STOPWORDS = frozenset({
+    "make", "ensure", "improve", "increase", "reduce", "adjust", "update", "change",
+    "should", "would", "could", "needs", "need", "more", "less", "with", "this",
+    "that", "from", "into", "your", "also", "must", "very", "some", "such", "than",
+    "then", "them", "they", "have", "here", "when", "where", "which", "while",
+    "consider", "currently", "instead", "overall", "better", "properly", "across",
+})
+
+
+def _issue_words(fixes) -> set:
+    """The bag of meaningful words across a fix list — lowercased, alphanumeric,
+    >3 chars, minus generic filler. Used to compare one pass's issues against the
+    next so that reworded-but-identical feedback still reads as 'no progress'."""
+    words: set[str] = set()
+    for fix in (fixes or []):
+        for tok in re.findall(r"[a-z0-9]+", str(fix).lower()):
+            if len(tok) > 3 and tok not in _FIX_STOPWORDS:
+                words.add(tok)
+    return words
+
+
+def _jaccard(a: set, b: set) -> float:
+    """Set similarity |a∩b| / |a∪b|. Two empty sets are identical (1.0); one empty
+    and one non-empty share nothing (0.0)."""
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    union = len(a | b)
+    return len(a & b) / union if union else 1.0
+
+
+def _build_critique(spec: str, verdict: dict, pass_num: int) -> str:
+    """The work order sent back to the dev agent after a NEEDS_WORK/FAIL judge:
+    the spec, the verdict + summary, the weakest rubric areas (<4/5), and a NUMBERED
+    fix list — phrased as 'change the code in your worktree, then commit'."""
+    fixes = verdict.get("fixes") or []
+    scores = verdict.get("scores") or {}
+    summary = (verdict.get("summary") or "").strip()
+    weak = [k for k, v in sorted(scores.items()) if isinstance(v, (int, float)) and v < 4]
+    numbered = "\n".join(f"{i}. {f}" for i, f in enumerate(fixes, 1)) or (
+        "1. (no specific fixes listed — raise overall visual quality and spec adherence)"
+    )
+    parts = [
+        f"Visual QA (pass {pass_num}) reviewed your work and the verdict is "
+        f"{verdict.get('verdict', 'NEEDS_WORK')} — it does not yet meet the spec.",
+        f'\nThe spec it is judged against:\n"""\n{(spec or "").strip()}\n"""',
+    ]
+    if summary:
+        parts.append(f"\nReviewer summary: {summary}")
+    if weak:
+        parts.append(f"\nWeakest areas (scored below 4/5): {', '.join(weak)}.")
+    parts.append(f"\nAddress these, most important first:\n{numbered}")
+    parts.append(
+        "\nMake the ACTUAL code changes in your worktree to fix every point above, "
+        "keeping the rest of the page intact. When done, run "
+        '`git add -A && git commit -m "QA fixes"` so the changes are saved to git, '
+        "then end with a one-line summary of what you changed."
+    )
+    return "\n".join(parts)
+
+
+def _qa_max_iters() -> int:
+    """Default number of QA-fix passes. Override JARVIS_QA_MAX_ITERS (min 1)."""
+    try:
+        return max(1, int(os.environ.get("JARVIS_QA_MAX_ITERS", "3")))
+    except ValueError:
+        return 3
+
+
+def _qa_fix_timeout() -> float:
+    """Seconds to wait for one agent fix turn. Override JARVIS_QA_FIX_TIMEOUT."""
+    try:
+        return max(1.0, float(os.environ.get("JARVIS_QA_FIX_TIMEOUT", "240")))
+    except ValueError:
+        return 240.0
+
+
 @dataclass
 class Agent:
     id: str
@@ -233,6 +323,16 @@ class Agent:
     events: deque = field(default_factory=lambda: deque(maxlen=50))
     drain_task: Optional[asyncio.Task] = None
     created: float = field(default_factory=time.time)
+    # ── closed-loop QA (P3b) ──
+    # Set by the drain loop when a turn's ResultMessage arrives, so the QA-fix
+    # loop can await "the agent finished the fix I asked for". Cleared before each
+    # instruct. asyncio.Event() binds to no running loop at construction (3.10+),
+    # so it is safe as a dataclass default_factory.
+    turn_done: asyncio.Event = field(default_factory=asyncio.Event)
+    # The current spoken line + a monotonic sequence. The Rust poll thread (P2)
+    # speaks `announce` once each time `announce_seq` increases past what it saw.
+    announce: Optional[str] = None
+    announce_seq: int = 0
 
     def summary(self) -> dict:
         return {
@@ -246,6 +346,10 @@ class Agent:
             "turns": self.turns,
             "last": self.last_text[:200],
             "created": round(self.created, 1),
+            # Spoken-update channel for the QA-fix loop (P3b): the latest line and
+            # its sequence, so the voice layer narrates each verdict exactly once.
+            "announce": self.announce,
+            "announce_seq": self.announce_seq,
             # An in-process Agent is always live (has a usable ClaudeSDKClient).
             # Records resurrected from the on-disk registry get live=False — the
             # SDK session can't be revived, so they're roster-only.
@@ -470,6 +574,162 @@ class AgentManager:
                  result["verdict"], result["scores"], result["shot_dir"])
         return result
 
+    def _resolve_live_agent(self, target: str) -> Agent:
+        """Resolve a `start_qa_loop` target to a LIVE in-process Agent (one with a
+        usable ClaudeSDKClient). Unlike `_resolve_qa_worktree`, a detached registry
+        record is NOT enough — the loop INSTRUCTS the agent to fix issues, which
+        needs a live SDK session. Accepts a live agent_id or a live agent NAME."""
+        raw = (target or "").strip()
+        if not raw:
+            raise ValueError("start_qa_loop needs a live agent_id or agent name")
+        _assert_not_protected(raw)  # hard protected-paths rule
+        if raw in self.agents:
+            return self.agents[raw]                       # 1) live agent_id
+        key = raw.lower()
+        for a in self.agents.values():
+            if a.name.lower() == key:
+                return a                                  # 2) live agent name
+        # A roster entry exists but has no live session — explain why it can't loop.
+        detached = raw in self.registry or any(
+            str(r.get("name", "")).lower() == key for r in self.registry.values()
+        )
+        if detached:
+            raise ValueError(
+                f"Agent {raw!r} is in the roster but DETACHED (no live session). The "
+                "QA-and-fix loop has to instruct it to make changes, which needs a live "
+                "agent — re-spawn it, then run the loop against the new agent."
+            )
+        raise KeyError(f"no live agent with id or name {raw!r}")
+
+    async def start_qa_loop(self, target: str, spec: str, max_iters: Optional[int] = None) -> dict:
+        """Kick off the closed self-correcting QA loop on a LIVE dev agent and return
+        IMMEDIATELY. The loop (serve → screenshot → judge → critique → re-judge until
+        PASS/stuck/exhausted) runs minutes as a background task, so it must not block
+        the MCP call; the proactive voice layer reports each verdict via `announce`.
+
+        The brain's only jobs are to KICK THIS OFF with one call and let the voice
+        narrate — all control flow lives here, never in a brain-driven tool dance."""
+        agent = self._resolve_live_agent(target)
+        _assert_not_protected(str(agent.worktree))
+        iters = _qa_max_iters() if max_iters is None else max(1, int(max_iters))
+        turn_timeout = _qa_fix_timeout()
+        log.info("[qa-loop] START     | agent=%s/%s max_iters=%d", agent.name, agent.id, iters)
+        self._event(agent, "qa_loop", f"starting QA-and-fix loop (max_iters={iters})")
+        asyncio.create_task(self._qa_fix_loop(agent, spec, iters, turn_timeout))
+        return {
+            "started": True,
+            "agent_id": agent.id,
+            "name": agent.name,
+            "max_iters": iters,
+            "message": (
+                f"Running QA-and-fix on {agent.name} (up to {iters} passes). "
+                "I'll tell you the outcome as it goes."
+            ),
+        }
+
+    async def _qa_fix_loop(
+        self, agent: Agent, spec: str, max_iters: int, turn_timeout: float
+    ) -> dict:
+        """The loop body (operates on a resolved LIVE agent). Each iteration serves +
+        screenshots + judges the worktree; on PASS it stops, otherwise it critiques the
+        agent and awaits its fix turn before re-judging. Always terminates via one of
+        the stop conditions — never loops forever, never silently gives up."""
+        history: list[dict] = []
+        spoken: list[str] = []
+        prev_words: Optional[set] = None
+        last_cap: Optional[dict] = None
+        last_verdict: Optional[dict] = None
+        passed = False
+        stop_reason = "exhausted"
+        i = 0
+
+        def say(text: str) -> None:
+            self._announce(agent, text)
+            spoken.append(text)
+
+        for i in range(1, max_iters + 1):
+            # serve → capture → judge (reuse the P3a one-shot pieces).
+            try:
+                with serve_app(agent.worktree) as url:
+                    cap = await capture(url, spec)
+                    verdict = await judge(
+                        spec, cap["shots"], cap.get("console_errors"), cap.get("page_errors")
+                    )
+            except Exception as e:  # noqa: BLE001 - a serve/capture/judge failure stops honestly
+                log.warning("[qa-loop] ERROR     | agent=%s pass=%d: %r", agent.id, i, e)
+                say(f"I hit an error QA-ing {agent.name}: {e}. Want to take a look?")
+                stop_reason = "qa_error"
+                break
+
+            last_cap, last_verdict = cap, verdict
+            v = verdict.get("verdict", "NEEDS_WORK")
+            scores = verdict.get("scores", {})
+            fixes = verdict.get("fixes") or []
+            history.append({"pass": i, "verdict": v, "scores": scores, "fixes": fixes})
+            self._event(agent, "qa_loop", f"pass {i}: {v} scores={scores}")
+            log.info("[qa-loop] pass %d    | agent=%s verdict=%s scores=%s", i, agent.id, v, scores)
+
+            if v == "PASS":
+                say(f"{agent.name} passed visual QA on pass {i}.")
+                passed, stop_reason = True, "passed"
+                break
+
+            # No progress: this pass's issues ~match the previous pass's → stop honestly.
+            words = _issue_words(fixes)
+            if prev_words is not None and _jaccard(prev_words, words) >= _NO_PROGRESS_SIM:
+                say(
+                    f"{agent.name} isn't making progress — same QA issues after pass {i}. "
+                    "Want to take a look?"
+                )
+                stop_reason = "stuck"
+                break
+            prev_words = words
+
+            # Out of passes.
+            if i == max_iters:
+                top = fixes[0] if fixes else "it still needs polish"
+                say(
+                    f"I've QA'd {agent.name} {max_iters} times and it still needs work — "
+                    f"{top}. Want to take a look?"
+                )
+                stop_reason = "exhausted"
+                break
+
+            # Otherwise instruct the agent to fix the issues and await its turn.
+            say(f"Pass {i}: {agent.name} still needs work — sending it the fixes.")
+            agent.turn_done.clear()
+            await agent.client.query(_build_critique(spec, verdict, i))
+            self._set_status(agent, "working")
+            try:
+                await asyncio.wait_for(agent.turn_done.wait(), turn_timeout)
+            except asyncio.TimeoutError:
+                say(f"{agent.name}'s fix took too long, so I stopped. Want to take a look?")
+                stop_reason = "fix_timeout"
+                break
+            if agent.status == "error":
+                say(f"{agent.name} hit an error while fixing the QA issues. Want to take a look?")
+                stop_reason = "agent_error"
+                break
+
+        result = {
+            "agent_id": agent.id,
+            "name": agent.name,
+            "passed": passed,
+            "stop_reason": stop_reason,
+            "iterations": i,
+            "final": (
+                _qa_result(agent.worktree, last_cap, last_verdict)
+                if last_cap is not None and last_verdict is not None
+                else None
+            ),
+            "history": history,
+            "spoken": spoken,
+        }
+        log.info("[qa-loop] DONE      | agent=%s passed=%s stop=%s iters=%d",
+                 agent.id, passed, stop_reason, i)
+        self._event(agent, "qa_loop", f"loop done: passed={passed} stop={stop_reason} iters={i}")
+        return result
+
     # ── reads (sync; cheap control-plane queries) ────────────────────────────
 
     def list(self) -> list[dict]:
@@ -519,6 +779,10 @@ class AgentManager:
                     # Persist AFTER turns/cost/last_text are updated so the
                     # registry snapshot captures the finished turn.
                     self._set_status(agent, "error" if msg.is_error else "idle")
+                    # Wake any QA-fix loop awaiting "this turn finished" (P3b). The
+                    # status is already set above, so a loop that races to read it
+                    # sees error/idle correctly.
+                    agent.turn_done.set()
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 - a dead stream must mark the agent, not crash the server
@@ -529,6 +793,15 @@ class AgentManager:
         agent.events.append({"t": round(time.time(), 1), "kind": kind, "text": text[:240]})
         # Mirror to the tailable log so the build is observable live.
         log.info("[%s/%s] %-9s | %s", agent.name, agent.id, kind, text[:240].replace("\n", " "))
+
+    def _announce(self, agent: Agent, text: str) -> None:
+        """Publish a spoken line for the QA-fix loop. Bumps announce_seq so the Rust
+        poll thread (P2) speaks it exactly once, mirrors it to the event feed, and
+        persists so a detached snapshot still carries the last thing said."""
+        agent.announce = text
+        agent.announce_seq += 1
+        self._event(agent, "announce", text)
+        self._persist(agent)
 
     def _get(self, agent_id: str) -> Agent:
         if agent_id not in self.agents:
