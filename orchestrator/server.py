@@ -66,5 +66,19 @@ async def qa_web_app(target: str, spec: str) -> dict:
     return await manager.qa_web_app(target, spec)
 
 
+@mcp.tool()
+async def start_qa_loop(target: str, spec: str, max_iters: int = 0) -> dict:
+    """Run the closed self-correcting QA-AND-FIX loop on a LIVE dev agent: QA the
+    app, and if it falls short of `spec`, critique the agent, let it fix the code,
+    and re-QA — repeating until it PASSES (or it gets stuck / runs out of passes).
+    Unlike qa_web_app (which only judges, read-only), this MUTATES: it drives the
+    agent to change and commit code. Returns IMMEDIATELY ({started: true, ...}); the
+    loop runs in the background and Jarvis narrates each verdict by voice as it goes.
+    `target` MUST be a LIVE agent's id or name (a detached/past agent can't be
+    instructed — spawn a fresh one first). `max_iters` caps the passes (0 = default,
+    from JARVIS_QA_MAX_ITERS, normally 3)."""
+    return await manager.start_qa_loop(target, spec, max_iters or None)
+
+
 if __name__ == "__main__":
     mcp.run()  # stdio transport by default

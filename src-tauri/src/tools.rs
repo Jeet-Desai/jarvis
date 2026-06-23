@@ -233,6 +233,24 @@ pub fn registry() -> Vec<Tool> {
             handler: qa_web_app,
         },
         Tool {
+            name: "start_qa_loop",
+            declaration: json!({
+                "name": "start_qa_loop",
+                "description": "Run the closed QA-AND-FIX loop on a LIVE dev agent: visually QA the web app, and if it falls short of the spec, critique the agent, let it FIX the code, and re-QA — repeating until it PASSES (or gets stuck / runs out of passes). Use when the user wants the agent to not just be checked but CORRECTED automatically — 'QA it and fix it until it passes', 'have it keep fixing the page until it's right', or 'yes, have it fix those' right after a qa_web_app verdict found problems. Unlike qa_web_app (which only judges, read-only), this MUTATES — it drives the agent to change and commit code. Returns IMMEDIATELY; the loop runs in the background and Jarvis narrates each verdict by voice as it goes — so after calling it, just tell the user it's running and DON'T poll. Pass `target` = a LIVE agent's id or name (call list_dev_agents first if unsure; a detached/past agent can't be looped — spawn a fresh one). `spec` = what the app should look like and do.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "target":    { "type": "string",  "description": "The LIVE agent's id or name whose work to QA-and-fix (from spawn_dev_agent / list_dev_agents)." },
+                        "spec":      { "type": "string",  "description": "What the app SHOULD look like and do, in plain language — the brief the page is judged against and fixed toward. Be specific (sections, layout, copy, colors, responsiveness)." },
+                        "max_iters": { "type": "integer", "description": "Optional. Max QA-and-fix passes before giving up. Omit (or 0) for the default (usually 3)." }
+                    },
+                    "required": ["target", "spec"]
+                }
+            }),
+            danger: DangerLevel::Mutating,
+            handler: start_qa_loop,
+        },
+        Tool {
             name: "type_text",
             declaration: json!({
                 "name": "type_text",
@@ -769,6 +787,15 @@ fn stop_dev_agent(args: &Value) -> Result<Value> {
 // so it leans on the orchestrator_call timeout; a static landing page is well within it.
 fn qa_web_app(args: &Value) -> Result<Value> {
     orchestrator_call("qa_web_app", args)
+}
+
+// Closed QA-and-fix loop: QA → critique → fix → re-QA until PASS/stuck/exhausted.
+// Mutating (it drives the agent to change code, like instruct_dev_agent), but it
+// returns IMMEDIATELY — the loop runs as a background task in the sidecar and is
+// narrated by voice — so it rides the default orchestrator_call timeout, not the
+// long qa_web_app one.
+fn start_qa_loop(args: &Value) -> Result<Value> {
+    orchestrator_call("start_qa_loop", args)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

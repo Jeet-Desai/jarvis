@@ -333,6 +333,10 @@ class Agent:
     # speaks `announce` once each time `announce_seq` increases past what it saw.
     announce: Optional[str] = None
     announce_seq: int = 0
+    # True while a _qa_fix_loop task is driving this agent. The voice layer uses it
+    # to SUPPRESS the generic "finished its turn"/"ran into an error" lines during a
+    # loop — the loop's own `announce` lines carry the narrative instead.
+    qa_active: bool = False
 
     def summary(self) -> dict:
         return {
@@ -347,9 +351,11 @@ class Agent:
             "last": self.last_text[:200],
             "created": round(self.created, 1),
             # Spoken-update channel for the QA-fix loop (P3b): the latest line and
-            # its sequence, so the voice layer narrates each verdict exactly once.
+            # its sequence, so the voice layer narrates each verdict exactly once;
+            # qa_active suppresses the generic status lines while the loop is running.
             "announce": self.announce,
             "announce_seq": self.announce_seq,
+            "qa_active": self.qa_active,
             # An in-process Agent is always live (has a usable ClaudeSDKClient).
             # Records resurrected from the on-disk registry get live=False — the
             # SDK session can't be revived, so they're roster-only.
@@ -614,7 +620,9 @@ class AgentManager:
         iters = _qa_max_iters() if max_iters is None else max(1, int(max_iters))
         turn_timeout = _qa_fix_timeout()
         log.info("[qa-loop] START     | agent=%s/%s max_iters=%d", agent.name, agent.id, iters)
+        agent.qa_active = True  # suppress generic status narration while the loop runs
         self._event(agent, "qa_loop", f"starting QA-and-fix loop (max_iters={iters})")
+        self._persist(agent)
         asyncio.create_task(self._qa_fix_loop(agent, spec, iters, turn_timeout))
         return {
             "started": True,
@@ -647,69 +655,76 @@ class AgentManager:
             self._announce(agent, text)
             spoken.append(text)
 
-        for i in range(1, max_iters + 1):
-            # serve → capture → judge (reuse the P3a one-shot pieces).
-            try:
-                with serve_app(agent.worktree) as url:
-                    cap = await capture(url, spec)
-                    verdict = await judge(
-                        spec, cap["shots"], cap.get("console_errors"), cap.get("page_errors")
+        try:
+            for i in range(1, max_iters + 1):
+                # serve → capture → judge (reuse the P3a one-shot pieces).
+                try:
+                    with serve_app(agent.worktree) as url:
+                        cap = await capture(url, spec)
+                        verdict = await judge(
+                            spec, cap["shots"], cap.get("console_errors"), cap.get("page_errors")
+                        )
+                except Exception as e:  # noqa: BLE001 - a serve/capture/judge failure stops honestly
+                    log.warning("[qa-loop] ERROR     | agent=%s pass=%d: %r", agent.id, i, e)
+                    say(f"I hit an error QA-ing {agent.name}: {e}. Want to take a look?")
+                    stop_reason = "qa_error"
+                    break
+
+                last_cap, last_verdict = cap, verdict
+                v = verdict.get("verdict", "NEEDS_WORK")
+                scores = verdict.get("scores", {})
+                fixes = verdict.get("fixes") or []
+                history.append({"pass": i, "verdict": v, "scores": scores, "fixes": fixes})
+                self._event(agent, "qa_loop", f"pass {i}: {v} scores={scores}")
+                log.info("[qa-loop] pass %d    | agent=%s verdict=%s scores=%s", i, agent.id, v, scores)
+
+                if v == "PASS":
+                    say(f"{agent.name} passed visual QA on pass {i}.")
+                    passed, stop_reason = True, "passed"
+                    break
+
+                # No progress: this pass's issues ~match the previous pass's → stop honestly.
+                words = _issue_words(fixes)
+                if prev_words is not None and _jaccard(prev_words, words) >= _NO_PROGRESS_SIM:
+                    say(
+                        f"{agent.name} isn't making progress — same QA issues after pass {i}. "
+                        "Want to take a look?"
                     )
-            except Exception as e:  # noqa: BLE001 - a serve/capture/judge failure stops honestly
-                log.warning("[qa-loop] ERROR     | agent=%s pass=%d: %r", agent.id, i, e)
-                say(f"I hit an error QA-ing {agent.name}: {e}. Want to take a look?")
-                stop_reason = "qa_error"
-                break
+                    stop_reason = "stuck"
+                    break
+                prev_words = words
 
-            last_cap, last_verdict = cap, verdict
-            v = verdict.get("verdict", "NEEDS_WORK")
-            scores = verdict.get("scores", {})
-            fixes = verdict.get("fixes") or []
-            history.append({"pass": i, "verdict": v, "scores": scores, "fixes": fixes})
-            self._event(agent, "qa_loop", f"pass {i}: {v} scores={scores}")
-            log.info("[qa-loop] pass %d    | agent=%s verdict=%s scores=%s", i, agent.id, v, scores)
+                # Out of passes.
+                if i == max_iters:
+                    top = fixes[0] if fixes else "it still needs polish"
+                    say(
+                        f"I've QA'd {agent.name} {max_iters} times and it still needs work — "
+                        f"{top}. Want to take a look?"
+                    )
+                    stop_reason = "exhausted"
+                    break
 
-            if v == "PASS":
-                say(f"{agent.name} passed visual QA on pass {i}.")
-                passed, stop_reason = True, "passed"
-                break
-
-            # No progress: this pass's issues ~match the previous pass's → stop honestly.
-            words = _issue_words(fixes)
-            if prev_words is not None and _jaccard(prev_words, words) >= _NO_PROGRESS_SIM:
-                say(
-                    f"{agent.name} isn't making progress — same QA issues after pass {i}. "
-                    "Want to take a look?"
-                )
-                stop_reason = "stuck"
-                break
-            prev_words = words
-
-            # Out of passes.
-            if i == max_iters:
-                top = fixes[0] if fixes else "it still needs polish"
-                say(
-                    f"I've QA'd {agent.name} {max_iters} times and it still needs work — "
-                    f"{top}. Want to take a look?"
-                )
-                stop_reason = "exhausted"
-                break
-
-            # Otherwise instruct the agent to fix the issues and await its turn.
-            say(f"Pass {i}: {agent.name} still needs work — sending it the fixes.")
-            agent.turn_done.clear()
-            await agent.client.query(_build_critique(spec, verdict, i))
-            self._set_status(agent, "working")
-            try:
-                await asyncio.wait_for(agent.turn_done.wait(), turn_timeout)
-            except asyncio.TimeoutError:
-                say(f"{agent.name}'s fix took too long, so I stopped. Want to take a look?")
-                stop_reason = "fix_timeout"
-                break
-            if agent.status == "error":
-                say(f"{agent.name} hit an error while fixing the QA issues. Want to take a look?")
-                stop_reason = "agent_error"
-                break
+                # Otherwise instruct the agent to fix the issues and await its turn.
+                say(f"Pass {i}: {agent.name} still needs work — sending it the fixes.")
+                agent.turn_done.clear()
+                await agent.client.query(_build_critique(spec, verdict, i))
+                self._set_status(agent, "working")
+                try:
+                    await asyncio.wait_for(agent.turn_done.wait(), turn_timeout)
+                except asyncio.TimeoutError:
+                    say(f"{agent.name}'s fix took too long, so I stopped. Want to take a look?")
+                    stop_reason = "fix_timeout"
+                    break
+                if agent.status == "error":
+                    say(f"{agent.name} hit an error while fixing the QA issues. Want to take a look?")
+                    stop_reason = "agent_error"
+                    break
+        finally:
+            # The loop is no longer driving this agent — let generic status narration
+            # resume, and never leave qa_active stuck on if something unexpected
+            # propagated out of the loop.
+            agent.qa_active = False
+            self._persist(agent)
 
         result = {
             "agent_id": agent.id,

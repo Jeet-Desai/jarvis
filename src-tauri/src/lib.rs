@@ -161,21 +161,31 @@ fn normalize_agent_value(val: serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// Diff a freshly-polled agent roster against the previous statuses and return
-/// the spoken one-line updates to announce. Updates `prev` in place.
+/// Diff a freshly-polled agent roster against the previous poll and return the
+/// spoken one-line updates to announce. Updates `prev` (last status) and
+/// `prev_announce` (last announce sequence) in place.
 ///
-/// We announce ONLY meaningful, finished-work transitions of a LIVE agent:
-///   • working → idle  ("finished its turn")
-///   • anything → error ("ran into an error")
-/// We deliberately ignore spawning/working (just-started) transitions — the
-/// brain already gives a one-line confirmation when it spawns an agent.
+/// Two channels feed the proactive voice:
+///   1. QA-loop narration — a closed QA-and-fix loop (P3b) publishes a spoken line
+///      via `announce` + a monotonic `announce_seq`. Each time the sequence
+///      increases we speak the new `announce` VERBATIM, exactly once. These lines
+///      carry the loop's own narrative ("Pass 1: still needs work…", "passed on
+///      pass 2").
+///   2. Generic status narration — for agents NOT in a loop:
+///        • working → idle  ("finished its turn")
+///        • anything → error ("ran into an error")
+///      We ignore spawning/working (just-started) transitions — the brain already
+///      confirms a spawn. While `qa_active` is true these generic lines are
+///      SUPPRESSED, so a loop's own announce lines are the only narrative (no
+///      "finished its turn" between fix passes).
 ///
-/// The FIRST poll seeds `prev` SILENTLY (`seeded == false`): otherwise every
-/// agent restored from the persistence registry, or already running when the
-/// app launched, would announce itself on startup. Detached (live=false)
-/// agents never announce — their status is frozen history.
+/// The FIRST poll seeds `prev` / `prev_announce` SILENTLY (`seeded == false`):
+/// otherwise every agent restored from the persistence registry, or already
+/// running when the app launched, would announce itself on startup. Detached
+/// (live=false) agents never announce — their status is frozen history.
 fn diff_agent_updates(
     prev: &mut std::collections::HashMap<String, String>,
+    prev_announce: &mut std::collections::HashMap<String, u64>,
     agents: &serde_json::Value,
     seeded: bool,
 ) -> Vec<String> {
@@ -188,9 +198,27 @@ fn diff_agent_updates(
         let status = a.get("status").and_then(|v| v.as_str()).unwrap_or("");
         let name = a.get("name").and_then(|v| v.as_str()).unwrap_or("an agent");
         let live = a.get("live").and_then(|v| v.as_bool()).unwrap_or(true);
+        let qa_active = a.get("qa_active").and_then(|v| v.as_bool()).unwrap_or(false);
+        let announce = a.get("announce").and_then(|v| v.as_str()).unwrap_or("");
+        let announce_seq = a.get("announce_seq").and_then(|v| v.as_u64()).unwrap_or(0);
         let prev_status = prev.insert(id.to_string(), status.to_string());
+        let prev_seq = prev_announce.insert(id.to_string(), announce_seq);
 
         if !seeded || !live {
+            continue;
+        }
+
+        // 1) QA-loop narration: speak each NEW announce line once. Kept ABOVE the
+        // qa_active gate so the final verdict (set as the loop ends and qa_active
+        // flips off in the same instant) is still spoken.
+        if let Some(pseq) = prev_seq {
+            if announce_seq > pseq && !announce.is_empty() {
+                out.push(announce.to_string());
+            }
+        }
+
+        // 2) Generic status narration — suppressed while a QA loop drives the agent.
+        if qa_active {
             continue;
         }
         let Some(ps) = prev_status.as_deref() else { continue };
@@ -712,6 +740,9 @@ pub fn run() {
                             // long monologue; drop the oldest when full.
                             const MAX_QUEUED: usize = 5;
                             let mut prev: HashMap<String, String> = HashMap::new();
+                            // Last QA-loop announce sequence seen per agent, so each
+                            // spoken verdict is narrated exactly once (P3b).
+                            let mut prev_announce: HashMap<String, u64> = HashMap::new();
                             let mut seeded = false;
                             let mut queue: VecDeque<String> = VecDeque::new();
                             loop {
@@ -723,7 +754,7 @@ pub fn run() {
                                     Ok(v) => {
                                         let agents = extract_agent_list(&v);
                                         gate::emit_agents(agents.clone());
-                                        for msg in diff_agent_updates(&mut prev, &agents, seeded) {
+                                        for msg in diff_agent_updates(&mut prev, &mut prev_announce, &agents, seeded) {
                                             queue.push_back(msg);
                                             while queue.len() > MAX_QUEUED {
                                                 queue.pop_front();
@@ -861,13 +892,27 @@ mod proactive_tests {
         )
     }
 
+    fn qa_agents(items: &[(&str, &str, &str, &str, u64, bool)]) -> serde_json::Value {
+        // (id, name, status, announce, announce_seq, qa_active); all live=true
+        serde_json::Value::Array(
+            items
+                .iter()
+                .map(|(id, name, status, announce, seq, qa)| {
+                    json!({ "id": id, "name": name, "status": status, "live": true,
+                            "announce": announce, "announce_seq": seq, "qa_active": qa })
+                })
+                .collect(),
+        )
+    }
+
     #[test]
     fn first_poll_seeds_silently() {
         // The very first poll must NOT announce — otherwise every agent already
         // running, or restored from the persistence registry, blurts on launch.
         let mut prev = HashMap::new();
+        let mut pa = HashMap::new();
         let now = agents(&[("a1", "site", "working", true), ("a2", "api", "idle", true)]);
-        let out = diff_agent_updates(&mut prev, &now, false);
+        let out = diff_agent_updates(&mut prev, &mut pa, &now, false);
         assert!(out.is_empty(), "first (unseeded) poll spoke: {out:?}");
         assert_eq!(prev.get("a1").map(String::as_str), Some("working"));
         assert_eq!(prev.get("a2").map(String::as_str), Some("idle"));
@@ -876,21 +921,23 @@ mod proactive_tests {
     #[test]
     fn working_to_idle_announces_once() {
         let mut prev = HashMap::new();
-        diff_agent_updates(&mut prev, &agents(&[("a1", "site", "working", true)]), false);
+        let mut pa = HashMap::new();
+        diff_agent_updates(&mut prev, &mut pa, &agents(&[("a1", "site", "working", true)]), false);
         // Turn finishes → one update.
-        let out = diff_agent_updates(&mut prev, &agents(&[("a1", "site", "idle", true)]), true);
+        let out = diff_agent_updates(&mut prev, &mut pa, &agents(&[("a1", "site", "idle", true)]), true);
         assert_eq!(out.len(), 1);
         assert!(out[0].contains("site") && out[0].contains("finished"), "{out:?}");
         // Stable across the next identical poll — no repeat.
-        let again = diff_agent_updates(&mut prev, &agents(&[("a1", "site", "idle", true)]), true);
+        let again = diff_agent_updates(&mut prev, &mut pa, &agents(&[("a1", "site", "idle", true)]), true);
         assert!(again.is_empty(), "repeated on an unchanged status: {again:?}");
     }
 
     #[test]
     fn transition_into_error_announces() {
         let mut prev = HashMap::new();
-        diff_agent_updates(&mut prev, &agents(&[("a1", "site", "working", true)]), false);
-        let out = diff_agent_updates(&mut prev, &agents(&[("a1", "site", "error", true)]), true);
+        let mut pa = HashMap::new();
+        diff_agent_updates(&mut prev, &mut pa, &agents(&[("a1", "site", "working", true)]), false);
+        let out = diff_agent_updates(&mut prev, &mut pa, &agents(&[("a1", "site", "error", true)]), true);
         assert_eq!(out.len(), 1);
         assert!(out[0].contains("error"), "{out:?}");
     }
@@ -899,11 +946,12 @@ mod proactive_tests {
     fn just_started_transitions_are_silent() {
         // spawning→working and idle→working (re-instructed) are NOT announced.
         let mut prev = HashMap::new();
-        diff_agent_updates(&mut prev, &agents(&[("a1", "site", "spawning", true)]), false);
-        let a = diff_agent_updates(&mut prev, &agents(&[("a1", "site", "working", true)]), true);
+        let mut pa = HashMap::new();
+        diff_agent_updates(&mut prev, &mut pa, &agents(&[("a1", "site", "spawning", true)]), false);
+        let a = diff_agent_updates(&mut prev, &mut pa, &agents(&[("a1", "site", "working", true)]), true);
         assert!(a.is_empty(), "announced a start: {a:?}");
-        diff_agent_updates(&mut prev, &agents(&[("a1", "site", "idle", true)]), true);
-        let b = diff_agent_updates(&mut prev, &agents(&[("a1", "site", "working", true)]), true);
+        diff_agent_updates(&mut prev, &mut pa, &agents(&[("a1", "site", "idle", true)]), true);
+        let b = diff_agent_updates(&mut prev, &mut pa, &agents(&[("a1", "site", "working", true)]), true);
         assert!(b.is_empty(), "announced a re-instruct: {b:?}");
     }
 
@@ -912,9 +960,50 @@ mod proactive_tests {
         // A live=false agent is frozen history (from the persistence registry);
         // even a working→idle-looking change on it must stay silent.
         let mut prev = HashMap::new();
-        diff_agent_updates(&mut prev, &agents(&[("a1", "site", "working", false)]), false);
-        let out = diff_agent_updates(&mut prev, &agents(&[("a1", "site", "idle", false)]), true);
+        let mut pa = HashMap::new();
+        diff_agent_updates(&mut prev, &mut pa, &agents(&[("a1", "site", "working", false)]), false);
+        let out = diff_agent_updates(&mut prev, &mut pa, &agents(&[("a1", "site", "idle", false)]), true);
         assert!(out.is_empty(), "announced a detached agent: {out:?}");
+    }
+
+    #[test]
+    fn qa_loop_announce_seq_emits_once_and_suppresses_generic() {
+        // The closed QA-and-fix loop (P3b) narrates via announce/announce_seq, and
+        // its generic status lines are suppressed while qa_active.
+        let mut prev = HashMap::new();
+        let mut pa = HashMap::new();
+        // First poll seeds both maps silently.
+        let seed = qa_agents(&[("a1", "site", "working", "", 0, true)]);
+        assert!(diff_agent_updates(&mut prev, &mut pa, &seed, false).is_empty());
+
+        // Loop announces pass 1 (seq 0→1) → spoken verbatim, exactly once.
+        let p1 = qa_agents(&[(
+            "a1", "site", "working",
+            "Pass 1: site still needs work — sending it the fixes.", 1, true,
+        )]);
+        let out = diff_agent_updates(&mut prev, &mut pa, &p1, true);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].contains("Pass 1"), "{out:?}");
+        // Same seq next poll → silent (no repeat).
+        let again = diff_agent_updates(&mut prev, &mut pa, &p1, true);
+        assert!(again.is_empty(), "repeated announce: {again:?}");
+
+        // The fix turn finishes (working→idle) WHILE qa_active → the generic
+        // "finished its turn" line is SUPPRESSED; only loop announces narrate.
+        let idle_active = qa_agents(&[(
+            "a1", "site", "idle",
+            "Pass 1: site still needs work — sending it the fixes.", 1, true,
+        )]);
+        let suppressed = diff_agent_updates(&mut prev, &mut pa, &idle_active, true);
+        assert!(suppressed.is_empty(), "spoke generic status during a QA loop: {suppressed:?}");
+
+        // PASS: a new announce (seq 1→2) lands the same instant qa_active flips off.
+        // The verdict still speaks (announce is above the suppression gate) and
+        // there's no duplicate generic line.
+        let passed = qa_agents(&[("a1", "site", "idle", "site passed visual QA on pass 2.", 2, false)]);
+        let done = diff_agent_updates(&mut prev, &mut pa, &passed, true);
+        assert_eq!(done.len(), 1, "{done:?}");
+        assert!(done[0].contains("passed"), "{done:?}");
     }
 }
 
