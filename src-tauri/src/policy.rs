@@ -491,6 +491,31 @@ pub fn describe(tool: &str, args: &Value) -> String {
             format!("instruct {who}: {}", clip(&i, 80))
         }),
         "stop_dev_agent" => arg_str(args, "agent_id").map(|a| format!("stop dev agent {a}")),
+        // Browser control (Jarvis's own Chrome). Deliberately DON'T echo typed
+        // text (browser_type) for the same reason as type_text — the summary is
+        // spoken aloud and could leak a password.
+        "browser_navigate" => arg_str(args, "url").map(|u| format!("browse to {}", clip(&u, 80))),
+        "browser_navigate_back" => Some("browser: go back".into()),
+        "browser_snapshot" => Some("read the browser page".into()),
+        "browser_click" => Some(format!(
+            "click {} (browser)",
+            arg_str(args, "element").unwrap_or_else(|| "element".into())
+        )),
+        "browser_type" => Some(format!(
+            "type into {} (browser)",
+            arg_str(args, "element").unwrap_or_else(|| "a field".into())
+        )),
+        "browser_press_key" => arg_str(args, "key").map(|k| format!("browser: press {k}")),
+        "browser_select_option" => Some(format!(
+            "select in {} (browser)",
+            arg_str(args, "element").unwrap_or_else(|| "a dropdown".into())
+        )),
+        "browser_hover" => Some(format!(
+            "hover {} (browser)",
+            arg_str(args, "element").unwrap_or_else(|| "element".into())
+        )),
+        "browser_wait_for" => Some("wait in the browser".into()),
+        "browser_tabs" => arg_str(args, "action").map(|a| format!("browser tab: {a}")),
         _ => None,
     };
     detail.unwrap_or_else(|| tool.replace('_', " "))

@@ -1,9 +1,36 @@
 # HANDOFF — next session starts here
 
-> As of `main` @ a clean, fully-committed checkpoint (2026-06-22). Read the
-> auto-loaded memory notes first (`MEMORY.md` index → especially
-> `jarvis-subscription-brain`, `jarvis-3-dev-orchestrator`,
+> **As of 2026-06-29 — UNCOMMITTED work on `main` (browser control via Playwright MCP).**
+> The most recent work is the "## 🌐 Browser control" section directly below — start there.
+> Read the auto-loaded memory notes first (`MEMORY.md` index → especially
+> `jarvis-browser-control-playwright` (the newest, covers this work),
+> `jarvis-subscription-brain`, `jarvis-3-dev-orchestrator`, `jarvis-qa-judge-on-claude`,
 > `jarvis-protected-paths-rule`, `jarvis-no-coauthor-commits`).
+> (The P2 / P3 / P3b sections lower down are older history — P3b is now DONE & voice-validated.)
+
+## 🌐 Browser control via Playwright MCP — accurate web actuation (2026-06-29, UNCOMMITTED)
+
+This is the backlog "**P4 — structured actuation: adopt Playwright MCP … retires the pixel-clicking weak spot**" item (see bottom), now largely built. Memory note: **`jarvis-browser-control-playwright`** (read it — it has the full architecture + the Comet wall).
+
+**Why:** OS-level web clicking (macOS AX tree + `locate_on_screen` vision) was inaccurate (clicked *right of* YouTube's Shorts icon) AND the brain then **lied** "done" off an unverified click. Fix = drive a real browser through Playwright's DOM (accurate + verifiable).
+
+**Architecture (mirrors the calendar MCP — same `rmcp`/`TokioChildProcess` stdio pattern):**
+- `mcp.rs`: `playwright: OnceLock<RunningService>` + `init_playwright(profile_dir)` spawns `npx -y @playwright/mcp@latest --output-dir <app_data>/playwright-output` + (mode-dependent flags). `playwright_call(tool,args)` (45s timeout), `playwright_ready()`.
+- **Mode via env `JARVIS_BROWSER_MODE`** (read in `init_playwright`): `extension` → `--extension` (drive the user's REAL browser tabs); anything else / unset → **dedicated** Chrome (`--browser chrome --user-data-dir <app_data>/playwright-profile`). Optional `PLAYWRIGHT_MCP_EXTENSION_TOKEN` (inherited by the child) skips the connect dialog.
+- `lib.rs` setup: `init_playwright` on a **background thread** (first `npx` may download).
+- `tools.rs`: **10 curated `browser_*` Tools** in `registry()` — navigate, navigate_back, snapshot, click, type, press_key, select_option, hover, wait_for, tabs — handlers → `playwright_call`; declarations copied from the server's real inputSchemas (snapshot→`ref`→click-by-ref). `browser_snapshot` added to `is_untrusted_reader` (taint). `policy.rs::describe` has browser_* cases (doesn't echo typed text).
+- `brain/mod.rs` system prompt **strongly rewritten**: "if `get_focused_app` returns a browser → use `browser_*` ONLY; HARD-ban `click`/`scroll`/`click_element`/`read_screen_elements`/`locate_on_screen`/`see_screen` on web pages; NEVER claim 'done' without a fresh verifying `browser_snapshot`." Rule 2 routes *acting* to browser_*; the "what I'm looking at → OS-level" loophole was removed (native-apps only).
+- Gating is automatic — every tool flows through `tools::dispatch` → policy gate → audit → activity feed, and the claude-code brain sees them via `mcp_server.rs` (lists `tools::registry()`).
+
+**STATE (2026-06-29):**
+- ✅ **Dedicated-Chrome mode WORKS** — clicks accurately by DOM ref + verifies (proven: Shorts/Like/Subscriptions dead-on). `.env` is set to `JARVIS_BROWSER_MODE=dedicated` (the working mode).
+- ✅ **The two bugs are FIXED & validated** — brain uses `browser_snapshot` (not vision) and reports honestly (it said "extension isn't connected" instead of faking success). The 3 sibling fixes also landed: AGENTS-panel flicker (`AgentsPanel.tsx` `<For>`→`<Index>`), verify-before-claim, AX-first.
+- ⛔ **BLOCKED: driving the user's REAL Comet browser.** `@playwright/mcp --extension` is Chrome/Edge-specific — its preflight checks Chrome's profile and won't connect to the extension that IS installed in Comet ("isn't installed in your Chrome"; microsoft/playwright-mcp **#1577**). The Comet status page showed "No clients connected" the whole time. CDP-attach alternative is blocked by the **Chromium-136** default-profile rule.
+- The official extension is legit: CWS "Playwright Extension" id `mmlmfjhmonkocbjadbfplnigmagldckm`, Developer **Microsoft / Playwright Team** (source in `microsoft/playwright` repo `packages/extension`).
+
+**If revisiting the REAL-browser goal:** (a) use **Chrome** instead of Comet (extension works there); (b) **CDP→Comet** (launch Comet `--remote-debugging-port`, `--cdp-endpoint` — gamble vs Chrome-136); (c) tighten **dedicated**-mode UX (it's a separate window). Flipping modes = one `.env` line + relaunch, **no rebuild**.
+
+**Uncommitted as of pause:** 6 source files (`AgentsPanel.tsx`, `lib.rs`, `mcp.rs`, `policy.rs`, `tools.rs`, `brain/mod.rs`) + `.gitignore` (added `.playwright-mcp/`). `.env` is gitignored. **Commit when the user asks** (no `Co-Authored-By`). `cargo check` clean; built+installed via `pnpm install:app`; app last left running in dedicated mode.
 
 ## ⛔ Two hard rules (already enforced — don't regress)
 1. **protected paths**: never touch any path matching the `JARVIS_PROTECTED_PATHS` markers — hard-denied in `policy.rs::protected_path_guard` (every mode) + `orchestrator/manager.py::_assert_not_protected`. See `jarvis-protected-paths-rule`.
@@ -95,7 +122,8 @@ it grounds in the pixels). **Working tree is uncommitted — commit when the use
   workarounds; `manager.py` resolver now also accepts an agent NAME. Re-tested → routes correctly. **This is the
   load-bearing lesson for P3b: the loop must be SIDECAR-DRIVEN, not brain-driven.**
 
-## ⏭️ NEXT — P3b: the closed self-correcting loop (the hero) — APPROVED, NOT STARTED
+## ✅ P3b DONE + voice-validated (2026-06-23) — the closed self-correcting QA loop
+The hero loop shipped: spoke a command → one dev-agent spawn → loop WAITs for the build → pass-1 PASS → spoken verdict. Lives in `manager.py::_qa_fix_loop`/`start_qa_loop`; brain steer is Rule 7b (`brain/mod.rs`); voice narration via `announce`/`announce_seq`+`qa_active` in `lib.rs::diff_agent_updates`. Two bugs found+fixed in testing: `c9ba825` (LLM_PROVIDERS made an allowlist, stops a timed-out primary from falling over to gemini and re-spawning a duplicate agent) and `b1d9a37` (loop waits for the in-flight build before the first QA). See memory `jarvis-qa-judge-on-claude`. (Original plan below for reference.)
 **Read [`docs/P3b-plan.md`](docs/P3b-plan.md)** — a full, staged, cost-disciplined plan (the design is worked
 out: sidecar-driven loop, `turn_done` Event to await agent turns, `announce`/`announce_seq` → proactive voice,
 stop conditions, the Python-first/Rust-last staging, free unit tests before any agent spawn). The user APPROVED
@@ -103,9 +131,7 @@ P3b knowing it spawns/instructs dev agents = **Claude subscription cost**; still
 agent-spawn validation (Stage 2). Base for the fresh session: `main` @ `0640d9d` (clean).
 
 ## Then (backlog, prioritized)
-- **P4 — structured actuation:** adopt **Playwright MCP** (spawn like the calendar MCP); reorder
-  the system prompt to a waterfall **AX tree → Playwright MCP → OmniParser-grounded vision → raw
-  `locate_on_screen` (last resort)** — retires the pixel-clicking weak spot. Wire `can_use_tool`→gate.
+- **P4 — structured actuation:** ✅ *largely DONE 2026-06-29 (see "🌐 Browser control" up top, uncommitted)* — Playwright MCP is spawned like the calendar MCP, 10 `browser_*` tools registered + gated, system prompt rewritten so web pages route to `browser_*` (DOM) not pixel-clicking. **Still open:** driving the user's REAL browser (Comet blocked by #1577 / Chrome-136 — works in dedicated Chrome); per-action `can_use_tool`→gate; optional OmniParser-grounded vision for the *native-app* fallback path.
 - Brain polish: persistent `ClaudeSDKClient` session (cut per-turn latency), streaming TTS, ⌘⇧S kills the `claude` subprocess.
 - Plan-confirm-execute voice ritual + codebase-aware STT (resolve "the auth modal" → real file).
 - Windows port = swap `control/` only (architecture already portable).

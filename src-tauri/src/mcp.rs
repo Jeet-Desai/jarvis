@@ -35,6 +35,10 @@ pub struct McpManager {
     calendar: OnceLock<RunningService<RoleClient, ()>>,
     /// Same, for the dev-agent orchestrator sidecar (`orchestrator/`).
     orchestrator: OnceLock<RunningService<RoleClient, ()>>,
+    /// Same, for the Playwright browser-control server (`@playwright/mcp`) — a
+    /// DEDICATED Chrome Jarvis drives via the real DOM (accurate clicks), kept
+    /// fully separate from the user's everyday browser.
+    playwright: OnceLock<RunningService<RoleClient, ()>>,
 }
 
 static GLOBAL: OnceLock<Arc<McpManager>> = OnceLock::new();
@@ -54,6 +58,7 @@ impl McpManager {
             runtime,
             calendar: OnceLock::new(),
             orchestrator: OnceLock::new(),
+            playwright: OnceLock::new(),
         }))
     }
 
@@ -220,6 +225,117 @@ impl McpManager {
             Ok(Ok(r)) => Ok(extract_text_content(&r)),
             Ok(Err(e)) => Err(e.into()),
             Err(_) => bail!("Orchestrator call timed out after {timeout_secs}s — the sidecar may be stuck"),
+        }
+    }
+
+    /// Spawn the Playwright browser-control server (`@playwright/mcp`) and finish
+    /// the handshake. Two modes, selected by env `JARVIS_BROWSER_MODE`:
+    ///
+    /// - `extension` → drive the user's REAL browser via the "Playwright
+    ///   Extension" (it bridges to their LIVE tabs over `chrome.debugger` — real
+    ///   session, no relaunch, sidesteps the Chrome-136 default-profile CDP
+    ///   block). The user installs the extension once and approves a tab on first
+    ///   use (or sets `PLAYWRIGHT_MCP_EXTENSION_TOKEN`, inherited by the child, to
+    ///   skip the approval dialog).
+    /// - anything else (default) → Jarvis's OWN dedicated Chrome under a private
+    ///   persistent `profile_dir`, separate from the user's everyday browser.
+    ///   The proven fallback.
+    ///
+    /// stdio transport (no `--port`) is what the TokioChildProcess bridge speaks
+    /// — same pattern as the calendar server. The browser connects lazily on the
+    /// first browser tool call, so spawning here is cheap either way.
+    pub fn init_playwright(&self, profile_dir: &str) -> Result<()> {
+        let extension_mode = std::env::var("JARVIS_BROWSER_MODE")
+            .map(|m| m.eq_ignore_ascii_case("extension"))
+            .unwrap_or(false);
+        let profile = profile_dir.to_string();
+        // Pin @playwright/mcp's session output (snapshot/console/network dumps) to
+        // an app-owned dir. Otherwise it writes a `.playwright-mcp/` folder into
+        // the process CWD — which is the repo during dev and an unwritable path
+        // (`/`) for a Finder-launched bundle.
+        let output_dir = std::path::Path::new(&profile)
+            .parent()
+            .map(|p| p.join("playwright-output"))
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| format!("{profile}-output"));
+        let service = self.runtime.block_on(async move {
+            let transport =
+                TokioChildProcess::new(TokioCommand::new("npx").configure(|c| {
+                    c.arg("-y")
+                        .arg("@playwright/mcp@latest")
+                        .arg("--output-dir")
+                        .arg(&output_dir);
+                    if extension_mode {
+                        // Connect to the user's real browser tabs. The token (if
+                        // present in Jarvis's env) is inherited by this child so
+                        // @playwright/mcp can auto-approve connections.
+                        c.arg("--extension");
+                    } else {
+                        c.arg("--browser")
+                            .arg("chrome")
+                            .arg("--user-data-dir")
+                            .arg(&profile);
+                    }
+                }))?;
+            let service = ().serve(transport).await?;
+            match service.peer().list_all_tools().await {
+                Ok(tools) => {
+                    tracing::info!("mcp[playwright]: {} browser tools available", tools.len())
+                }
+                Err(e) => tracing::warn!("mcp[playwright]: list_all_tools failed: {e}"),
+            }
+            Ok::<_, anyhow::Error>(service)
+        })?;
+
+        let _ = self.playwright.set(service);
+        if extension_mode {
+            tracing::info!("mcp[playwright]: connected (EXTENSION mode — drives the user's real browser tabs)");
+        } else {
+            tracing::info!("mcp[playwright]: connected (dedicated Chrome, profile={profile_dir})");
+        }
+        Ok(())
+    }
+
+    /// True once the Playwright browser server is connected. The browser tool
+    /// handlers use this to give a friendly "still starting up" message instead
+    /// of a hard error if the brain reaches for a browser tool too early.
+    pub fn playwright_ready(&self) -> bool {
+        self.playwright.get().is_some()
+    }
+
+    /// Call a tool on the Playwright browser server. Blocks until reply.
+    /// 45s budget: a `browser_navigate` to a slow site can take a while (the
+    /// server's own navigation timeout is 60s), but we cap below the brain
+    /// timeout so a stuck page can't wedge the turn.
+    pub fn playwright_call(&self, tool_name: &str, args: Value) -> Result<Value> {
+        let peer = self
+            .playwright
+            .get()
+            .ok_or_else(|| {
+                anyhow!(
+                    "The browser isn't ready yet — Playwright is still starting up (it spins up a few seconds after launch). Tell the user to try again in a moment."
+                )
+            })?
+            .peer()
+            .clone();
+        let args_map = args.as_object().cloned();
+        let tool_name = tool_name.to_string();
+
+        let result = self.runtime.block_on(async move {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(45),
+                peer.call_tool(CallToolRequestParam {
+                    name: tool_name.into(),
+                    arguments: args_map,
+                }),
+            )
+            .await
+        });
+
+        match result {
+            Ok(Ok(r)) => Ok(extract_text_content(&r)),
+            Ok(Err(e)) => Err(e.into()),
+            Err(_) => bail!("Browser action timed out after 45s — the page may be slow or stuck"),
         }
     }
 }

@@ -541,6 +541,141 @@ pub fn registry() -> Vec<Tool> {
             danger: DangerLevel::ReadOnly,
             handler: search_files,
         },
+        // ── Browser control: Jarvis's OWN dedicated Chrome via @playwright/mcp ──
+        // Drives a private Chrome window through the REAL DOM — accurate clicks,
+        // not vision guesses. The workflow is always: navigate → snapshot (to get
+        // element `ref`s) → click/type by ref → snapshot again to verify.
+        Tool {
+            name: "browser_navigate",
+            declaration: json!({
+                "name": "browser_navigate",
+                "description": "Open a URL in the browser Jarvis controls via Playwright (the accurate, robust way to do ANY web task: browse, search, open a site, operate a web app). Prefer it over OS-level click/scroll for anything on the web. After it loads, call browser_snapshot to see the page.",
+                "parameters": { "type": "object", "properties": {
+                    "url": { "type": "string", "description": "The URL to open (include https://). For a search, navigate to the site or e.g. https://www.google.com/search?q=..." }
+                }, "required": ["url"] }
+            }),
+            danger: DangerLevel::Mutating,
+            handler: browser_navigate,
+        },
+        Tool {
+            name: "browser_snapshot",
+            declaration: json!({
+                "name": "browser_snapshot",
+                "description": "Capture the current page in Jarvis's browser as an accessibility tree of every element, EACH WITH A `ref` id. This is how you SEE the page and get the `ref`s you pass as `target` to browser_click / browser_type. ALWAYS snapshot before clicking/typing (to target the real element) AND after an action (to VERIFY the page actually changed). Better than a screenshot for deciding what to do.",
+                "parameters": { "type": "object", "properties": {
+                    "depth": { "type": "integer", "description": "Optional. Limit the tree depth on very large pages to keep the snapshot focused." }
+                } }
+            }),
+            danger: DangerLevel::ReadOnly,
+            handler: browser_snapshot,
+        },
+        Tool {
+            name: "browser_click",
+            declaration: json!({
+                "name": "browser_click",
+                "description": "Click an element in Jarvis's browser by its `ref` from the latest browser_snapshot. Clicks the real DOM element's center after scrolling it into view — accurate. Snapshot first to get the ref; snapshot again afterward to confirm the result.",
+                "parameters": { "type": "object", "properties": {
+                    "element": { "type": "string", "description": "Short human-readable description of what you're clicking, e.g. 'Shorts sidebar link'." },
+                    "target": { "type": "string", "description": "The exact element `ref` from the latest browser_snapshot, e.g. 'e47'." },
+                    "doubleClick": { "type": "boolean", "description": "Optional. Double-click instead of single. Default false." },
+                    "button": { "type": "string", "enum": ["left","right","middle"], "description": "Optional. Mouse button, default left." }
+                }, "required": ["element","target"] }
+            }),
+            danger: DangerLevel::Mutating,
+            handler: browser_click,
+        },
+        Tool {
+            name: "browser_type",
+            declaration: json!({
+                "name": "browser_type",
+                "description": "Type text into an editable element in Jarvis's browser, targeting it by its `ref` from the latest browser_snapshot. Set submit=true to press Enter after (to send a search/query). Snapshot first to get the ref.",
+                "parameters": { "type": "object", "properties": {
+                    "element": { "type": "string", "description": "Short description of the field, e.g. 'search box'." },
+                    "target": { "type": "string", "description": "The exact element `ref` from the latest browser_snapshot." },
+                    "text": { "type": "string", "description": "The text to type." },
+                    "submit": { "type": "boolean", "description": "Optional. Press Enter after typing (submit). Default false." }
+                }, "required": ["element","target","text"] }
+            }),
+            danger: DangerLevel::Mutating,
+            handler: browser_type,
+        },
+        Tool {
+            name: "browser_press_key",
+            declaration: json!({
+                "name": "browser_press_key",
+                "description": "Press a single key in Jarvis's browser, e.g. 'Enter', 'ArrowDown', 'PageDown', 'End', 'Escape', or a character. Use PageDown / End to scroll a web page (don't use the OS-level scroll tool for Jarvis's browser).",
+                "parameters": { "type": "object", "properties": {
+                    "key": { "type": "string", "description": "Key name (e.g. 'Enter', 'ArrowDown', 'PageDown', 'End') or a character." }
+                }, "required": ["key"] }
+            }),
+            danger: DangerLevel::Mutating,
+            handler: browser_press_key,
+        },
+        Tool {
+            name: "browser_select_option",
+            declaration: json!({
+                "name": "browser_select_option",
+                "description": "Choose option(s) in a dropdown (<select>) in Jarvis's browser, targeting it by its `ref` from the latest browser_snapshot.",
+                "parameters": { "type": "object", "properties": {
+                    "element": { "type": "string", "description": "Short description of the dropdown." },
+                    "target": { "type": "string", "description": "The exact element `ref` from the latest browser_snapshot." },
+                    "values": { "type": "array", "items": { "type": "string" }, "description": "Option label(s) to select." }
+                }, "required": ["element","target","values"] }
+            }),
+            danger: DangerLevel::Mutating,
+            handler: browser_select_option,
+        },
+        Tool {
+            name: "browser_hover",
+            declaration: json!({
+                "name": "browser_hover",
+                "description": "Hover the pointer over an element in Jarvis's browser (to reveal a menu/tooltip), targeting it by its `ref` from the latest browser_snapshot.",
+                "parameters": { "type": "object", "properties": {
+                    "element": { "type": "string", "description": "Short description of the element to hover." },
+                    "target": { "type": "string", "description": "The exact element `ref` from the latest browser_snapshot." }
+                }, "required": ["element","target"] }
+            }),
+            danger: DangerLevel::Mutating,
+            handler: browser_hover,
+        },
+        Tool {
+            name: "browser_navigate_back",
+            declaration: json!({
+                "name": "browser_navigate_back",
+                "description": "Go back to the previous page in Jarvis's browser.",
+                "parameters": { "type": "object", "properties": {} }
+            }),
+            danger: DangerLevel::Mutating,
+            handler: browser_navigate_back,
+        },
+        Tool {
+            name: "browser_wait_for",
+            declaration: json!({
+                "name": "browser_wait_for",
+                "description": "Wait in Jarvis's browser for text to appear or disappear, or for a number of seconds — use after an action when the page needs a moment to update before you snapshot to verify.",
+                "parameters": { "type": "object", "properties": {
+                    "text":     { "type": "string", "description": "Optional. Wait until this text appears." },
+                    "textGone": { "type": "string", "description": "Optional. Wait until this text disappears." },
+                    "time":     { "type": "number", "description": "Optional. Seconds to wait." }
+                } }
+            }),
+            danger: DangerLevel::ReadOnly,
+            handler: browser_wait_for,
+        },
+        Tool {
+            name: "browser_tabs",
+            declaration: json!({
+                "name": "browser_tabs",
+                "description": "Manage tabs in Jarvis's browser: list, open a new tab (optionally at a URL), close, or select a tab by index.",
+                "parameters": { "type": "object", "properties": {
+                    "action": { "type": "string", "enum": ["list","new","close","select"], "description": "What to do." },
+                    "index":  { "type": "number", "description": "Tab index for close/select." },
+                    "url":    { "type": "string", "description": "URL for a new tab." }
+                }, "required": ["action"] }
+            }),
+            danger: DangerLevel::Mutating,
+            handler: browser_tabs,
+        },
     ]
 }
 
@@ -797,6 +932,27 @@ fn qa_web_app(args: &Value) -> Result<Value> {
 fn start_qa_loop(args: &Value) -> Result<Value> {
     orchestrator_call("start_qa_loop", args)
 }
+
+// ── Browser control: proxy to Jarvis's dedicated Playwright Chrome (mcp.rs) ──
+// Every call still flows through tools::dispatch FIRST (policy gate + activity
+// feed + audit), exactly like the OS-level control tools. Args are passed
+// straight through — the tool declarations mirror @playwright/mcp's own input
+// schemas, so the brain's args match what the server expects.
+fn playwright_call(tool: &str, args: &Value) -> Result<Value> {
+    let mcp = crate::mcp::global().ok_or_else(|| anyhow::anyhow!("MCP manager not running"))?;
+    mcp.playwright_call(tool, args.clone())
+}
+
+fn browser_navigate(args: &Value) -> Result<Value> { playwright_call("browser_navigate", args) }
+fn browser_navigate_back(args: &Value) -> Result<Value> { playwright_call("browser_navigate_back", args) }
+fn browser_snapshot(args: &Value) -> Result<Value> { playwright_call("browser_snapshot", args) }
+fn browser_click(args: &Value) -> Result<Value> { playwright_call("browser_click", args) }
+fn browser_type(args: &Value) -> Result<Value> { playwright_call("browser_type", args) }
+fn browser_press_key(args: &Value) -> Result<Value> { playwright_call("browser_press_key", args) }
+fn browser_select_option(args: &Value) -> Result<Value> { playwright_call("browser_select_option", args) }
+fn browser_hover(args: &Value) -> Result<Value> { playwright_call("browser_hover", args) }
+fn browser_wait_for(args: &Value) -> Result<Value> { playwright_call("browser_wait_for", args) }
+fn browser_tabs(args: &Value) -> Result<Value> { playwright_call("browser_tabs", args) }
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Action tools — type text, focus apps, set clipboard. These are the "do
@@ -1368,6 +1524,7 @@ fn is_untrusted_reader(name: &str) -> bool {
             | "read_screen_elements"
             | "locate_on_screen"
             | "read_file"
+            | "browser_snapshot"
     )
 }
 

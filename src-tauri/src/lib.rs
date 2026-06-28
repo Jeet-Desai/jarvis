@@ -708,6 +708,24 @@ pub fn run() {
                         }
                     }
 
+                    // Playwright browser-control server (@playwright/mcp):
+                    // Jarvis's OWN dedicated Chrome, driven via the real DOM for
+                    // accurate clicks (not vision guesses). Spawned on a
+                    // background thread because the first `npx` run may download
+                    // the package — that must never delay the app window or mic.
+                    // The profile lives in the app data dir, kept separate from
+                    // the user's everyday Chrome so their real session is untouched.
+                    if let Ok(data_dir) = app.path().app_data_dir() {
+                        let pw_mgr = manager.clone();
+                        let profile = data_dir.join("playwright-profile");
+                        std::thread::spawn(move || {
+                            let profile = profile.to_string_lossy().into_owned();
+                            if let Err(e) = pw_mgr.init_playwright(&profile) {
+                                tracing::warn!("mcp[playwright]: {e}");
+                            }
+                        });
+                    }
+
                     // Dev-agent orchestrator sidecar. Look it up via
                     // JARVIS_ORCHESTRATOR_DIR, else assume the in-repo
                     // `orchestrator/` next to src-tauri. Non-fatal: if the venv

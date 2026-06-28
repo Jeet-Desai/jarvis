@@ -43,3 +43,7 @@ __pycache__/
 orchestrator/stage2-result.json
 orchestrator/stage2-run.out
 
+# Playwright MCP browser-control session output (snapshot/console/network dumps
+# written to .playwright-mcp/ in the cwd) — regenerated each run, never tracked.
+.playwright-mcp/
+
