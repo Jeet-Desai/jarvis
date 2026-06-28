@@ -1,4 +1,4 @@
-import { Show, For } from "solid-js";
+import { Show, Index } from "solid-js";
 import { agents, type AgentItem, type AgentStatus } from "./state";
 import "./confirm.css";
 
@@ -33,14 +33,20 @@ export function AgentsPanel(props: { limit?: number }) {
   return (
     <Show when={items().length > 0} fallback={<div class="jv-activity-empty">no agents</div>}>
       <div class="jv-activity">
-        <For each={items()}>{(agent) => <AgentRow agent={agent} />}</For>
+        {/* Index (position-keyed), NOT For (reference-keyed): the backend re-emits
+            a brand-new AgentItem[] every ~2s poll, so For would unmount+remount
+            every row each refresh (visible flicker). Index keeps the row DOM
+            mounted and only updates the changed text/glyph in place. */}
+        <Index each={items()}>{(agent) => <AgentRow agent={agent} />}</Index>
       </div>
     </Show>
   );
 }
 
-function AgentRow(props: { agent: AgentItem }) {
-  const a = () => props.agent;
+// `agent` is an Index accessor (() => AgentItem) so the row stays mounted and its
+// fields update reactively in place across refreshes (no remount = no flicker).
+function AgentRow(props: { agent: () => AgentItem }) {
+  const a = () => props.agent();
   const cost = () => `$${(a().cost_usd ?? 0).toFixed(2)}`;
   return (
     <div class="jv-agent-row" title={a().last}>
