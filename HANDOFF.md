@@ -1,12 +1,22 @@
 # HANDOFF — next session starts here
 
-> **As of 2026-06-29 — UNCOMMITTED work on `main` (browser control via Playwright MCP).**
-> The most recent work is the "## 🌐 Browser control" section directly below — start there.
+> **As of 2026-06-30 — voice I/O overhaul on `main` (UNCOMMITTED).**
+> The most recent work is the "## 🎙️ Voice I/O overhaul" section directly below — start there.
 > Read the auto-loaded memory notes first (`MEMORY.md` index → especially
-> `jarvis-browser-control-playwright` (the newest, covers this work),
+> `jarvis-voice-io-overhaul` (newest, covers this work), `jarvis-browser-control-playwright`,
 > `jarvis-subscription-brain`, `jarvis-3-dev-orchestrator`, `jarvis-qa-judge-on-claude`,
 > `jarvis-protected-paths-rule`, `jarvis-no-coauthor-commits`).
-> (The P2 / P3 / P3b sections lower down are older history — P3b is now DONE & voice-validated.)
+> (Browser control + P2/P3/P3b sections lower down are older history — all DONE.)
+
+## 🎙️ Voice I/O overhaul — clean TTS text, better STT, Kokoro neural voice (2026-06-30, UNCOMMITTED)
+
+The day-to-day "Jarvis mishears me / mispronounces / sounds robotic" friction. Three phases, all LOCAL/offline (no egress), Windows-portable. Full detail + gotchas in memory **`jarvis-voice-io-overhaul`**.
+
+- **Phase 1 — TTS text normalization (`src-tauri/src/speakable.rs`, NEW):** pure `to_speech()` called inside `tts::start_speaking` (single choke point; HUD keeps raw Markdown). Strips markdown/emoji/fenced-code, turns links→label, bare URLs→spoken host ("github dot com"), `snake_case`→words. 11 tests. ✅ shipped + installed.
+- **Phase 2 — Whisper STT (`src-tauri/src/stt.rs`):** model `base.en`→**`large-v3-turbo-q5_0`** (574MB, in models/, env `JARVIS_WHISPER_MODEL`, auto-picks strongest present best-first), **`initial_prompt` name-biasing** (`JARVIS_STT_VOCAB`), greedy→**beam** (`JARVIS_WHISPER_BEAM`). ✅ shipped + installed.
+- **Phase 3 — Kokoro neural TTS (`src-tauri/src/kokoro.rs` + `kokoro_vocab.rs`, NEW; replaces `say`):** `models/kokoro-v1.0.onnx` via **`ort` 2.x** + **`misaki-rs`** G2P (pure-Rust, no espeak install). Default voice **`bm_lewis`** (British male, user-picked). `tts.rs::speak_kokoro` writes a STEREO 24kHz WAV → `afplay` as the same killable `SpeechHandle`; `say` is the fallback (`JARVIS_TTS=say`, or auto if models/init absent → strictly additive). Engine behind `OnceLock<Option<Mutex<Engine>>>`, `prewarm()` in lib.rs. Code-complete, `cargo check` clean, build+install for in-app validation in progress.
+
+**Key gotchas (also in memory):** Kokoro input tensor is named `tokens` not `input_ids` (read names off the model); `voices-v1.0.bin` is an NPZ (`[510,1,256]` per voice, index by token count); VOCAB = 114 symbols from Kokoro `config.json` (pull programmatically — LLM WebFetch mangles the IPA); mono WAV → afplay plays LEFT speaker only, must write stereo; ort `run` takes `&mut`, use `Tensor::from_array((shape,Vec))`. **Deps added** to src-tauri/Cargo.toml: ort, misaki-rs, ndarray, ndarray-npy. Env: `JARVIS_TTS`/`_TTS_VOICE`/`_TTS_SPEED`/`_WHISPER_MODEL`/`_STT_VOCAB`/`_WHISPER_BEAM` (all in `.env`). **De-risked in a scratch crate first** (scratchpad/ort-smoke). **Commit when the user asks** (no `Co-Authored-By`).
 
 ## 🌐 Browser control via Playwright MCP — accurate web actuation (2026-06-29, UNCOMMITTED)
 

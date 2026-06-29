@@ -7,11 +7,14 @@ mod audio;
 mod brain;
 mod control;
 mod gate;
+mod kokoro;
+mod kokoro_vocab;
 mod mcp;
 mod mcp_server;
 #[cfg(target_os = "macos")]
 mod permissions;
 mod policy;
+mod speakable;
 mod state;
 mod stt;
 mod tools;
@@ -846,6 +849,11 @@ pub fn run() {
             // Pre-warm the whisper model in the background so the first
             // transcription doesn't pay the ~1-2s model-load cost.
             stt::prewarm();
+
+            // Pre-warm the Kokoro TTS engine (ONNX session + voice pack + G2P)
+            // on a background thread so the first spoken reply is instant. If
+            // the models are absent or init fails, TTS silently uses `say`.
+            kokoro::prewarm();
 
             // Optional input-backend self-test (set JARVIS_SELFTEST_INPUT=1):
             // exercises enigo from a BACKGROUND thread — exactly the path that

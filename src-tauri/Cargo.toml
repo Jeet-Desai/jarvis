@@ -41,6 +41,15 @@ webrtc-vad = "0.4"
 # brain/ollama.rs can build precompiled patterns instead of string-matching.
 regex = "1"
 base64 = "0.22"
+# Kokoro neural TTS (replaces macOS `say`). ort = onnxruntime Rust bindings
+# (runs kokoro-v1.0.onnx; downloads a prebuilt onnxruntime at BUILD time, then
+# statically links → self-contained .app, no runtime network). misaki-rs =
+# pure-Rust port of Kokoro's reference G2P (default-features off → no native
+# espeak-ng, nothing to install). ndarray(-npy) loads the voices NPZ pack.
+ort = "2.0.0-rc.12"
+misaki-rs = { version = "0.3", default-features = false }
+ndarray = "0.16"
+ndarray-npy = "0.9"
 # MCP — both directions:
 #  • CLIENT: talks to external tool servers (e.g. @cocal/google-calendar-mcp and
 #    the dev-agent orchestrator) over stdio.

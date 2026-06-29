@@ -65,15 +65,32 @@ pnpm install >/dev/null
 echo "✓ frontend deps"
 
 # ── 8. Whisper model ───────────────────────────────────────────────────────
+# Default model is large-v3-turbo (q5 quantized): far better on accented
+# English + proper nouns than base.en, and still fast on Apple-Silicon Metal.
+# Override which model to fetch with JARVIS_WHISPER_MODEL=small|medium|base.en|
+# large-v3-turbo (STT resolves it best-first at runtime; see src/stt.rs).
 MODEL_DIR="models"
-MODEL_FILE="$MODEL_DIR/ggml-base.en.bin"
-MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
+WHISPER_MODEL="${JARVIS_WHISPER_MODEL:-large-v3-turbo-q5_0}"
+case "$WHISPER_MODEL" in *.bin) MODEL_NAME="$WHISPER_MODEL" ;; *) MODEL_NAME="ggml-$WHISPER_MODEL.bin" ;; esac
+MODEL_FILE="$MODEL_DIR/$MODEL_NAME"
+MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$MODEL_NAME"
 mkdir -p "$MODEL_DIR"
 if [[ ! -f "$MODEL_FILE" ]]; then
-  echo "→ Downloading whisper base.en model (~140 MB)…"
+  echo "→ Downloading whisper model $MODEL_NAME…"
   curl -L --fail --progress-bar -o "$MODEL_FILE" "$MODEL_URL"
 fi
-echo "✓ whisper model ($(du -sh "$MODEL_FILE" | cut -f1))"
+echo "✓ whisper model ($MODEL_NAME, $(du -sh "$MODEL_FILE" | cut -f1))"
+
+# ── 8b. Kokoro neural TTS model + voices ───────────────────────────────────
+# The natural local voice (replaces macOS `say`). ~88 MB model + ~27 MB voices.
+KOKORO_BASE="https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0"
+for kf in kokoro-v1.0.onnx voices-v1.0.bin; do
+  if [[ ! -f "$MODEL_DIR/$kf" ]]; then
+    echo "→ Downloading Kokoro $kf…"
+    curl -L --fail --progress-bar -o "$MODEL_DIR/$kf" "$KOKORO_BASE/$kf"
+  fi
+done
+echo "✓ kokoro TTS (kokoro-v1.0.onnx + voices-v1.0.bin)"
 
 # ── 9. .env ────────────────────────────────────────────────────────────────
 if [[ ! -f .env ]]; then
