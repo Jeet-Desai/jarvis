@@ -22,13 +22,93 @@ const WHISPER_SAMPLE_RATE: u32 = 16_000;
 
 static MODEL: OnceLock<WhisperContext> = OnceLock::new();
 
-/// Resolve the model path. Looks for `models/ggml-base.en.bin` relative to
-/// the workspace root (one level above `src-tauri/`).
-fn model_path() -> PathBuf {
+/// The `models/` dir, one level above `src-tauri/`.
+fn models_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .map(|p| p.join("models").join("ggml-base.en.bin"))
-        .unwrap_or_else(|| PathBuf::from("models/ggml-base.en.bin"))
+        .map(|p| p.join("models"))
+        .unwrap_or_else(|| PathBuf::from("models"))
+}
+
+/// Resolve the whisper model.
+///
+/// Override with `JARVIS_WHISPER_MODEL`: an absolute/relative path is used
+/// verbatim, a bare name (`small`, `medium`, `large-v3-turbo`, `base.en`) is
+/// resolved to `models/ggml-<name>.bin`. With no override we prefer the larger
+/// multilingual `ggml-small.bin` (much better on accented English + names) if
+/// it's been downloaded, else fall back to the `ggml-base.en.bin` that ships
+/// with `setup.sh` — so the app still works before the upgrade download.
+fn model_path() -> PathBuf {
+    let dir = models_dir();
+    if let Ok(m) = std::env::var("JARVIS_WHISPER_MODEL") {
+        let m = m.trim();
+        if !m.is_empty() {
+            let p = PathBuf::from(m);
+            if p.is_absolute() || m.contains('/') {
+                return p;
+            }
+            return dir.join(normalize_model_name(m));
+        }
+    }
+    // Best-first: pick the strongest model that's actually been downloaded so
+    // the upgrade "just works" without touching .env; base.en is the floor.
+    for cand in [
+        "ggml-large-v3-turbo.bin",
+        "ggml-large-v3-turbo-q5_0.bin",
+        "ggml-medium.bin",
+        "ggml-small.bin",
+        "ggml-base.en.bin",
+    ] {
+        let p = dir.join(cand);
+        if p.exists() {
+            return p;
+        }
+    }
+    dir.join("ggml-base.en.bin")
+}
+
+/// Map a short model name to its ggml filename (`small` → `ggml-small.bin`).
+/// A value that already looks like a filename is passed through.
+fn normalize_model_name(m: &str) -> String {
+    if m.ends_with(".bin") {
+        m.to_string()
+    } else {
+        format!("ggml-{m}.bin")
+    }
+}
+
+/// Whether the resolved model is English-only (a `.en` build). Multilingual
+/// builds still decode English fine when the language is pinned to "en", but
+/// `.en` models MUST be pinned — so we always pin "en" below regardless.
+fn model_is_english_only(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.contains(".en."))
+        .unwrap_or(false)
+}
+
+/// A small domain glossary fed to whisper as `initial_prompt` to bias decoding
+/// toward proper nouns it otherwise mangles (the user's name, app/brand names,
+/// tech terms). Whisper treats this as preceding context. Extend it with your
+/// own names via `JARVIS_STT_VOCAB` (a comma-separated list).
+fn initial_prompt() -> String {
+    const BASE: &str = "Jarvis, Jeet, Comet, Chrome, Safari, Arc, YouTube, Spotify, \
+        Slack, Notion, Gmail, Google, GitHub, Claude, Gemini, OpenAI, Anthropic, \
+        Tauri, Rust, Python, Playwright, Xcode, VS Code, Terminal, Finder, Calendar";
+    match std::env::var("JARVIS_STT_VOCAB") {
+        Ok(extra) if !extra.trim().is_empty() => format!("{BASE}, {}", extra.trim()),
+        _ => BASE.to_string(),
+    }
+}
+
+/// Beam width for decoding. Beam search beats greedy on accented speech; the
+/// encoder (the heavy pass) runs once regardless, so the cost is modest on
+/// Metal. `JARVIS_WHISPER_BEAM=1` (or 0) falls back to greedy.
+fn beam_size() -> i32 {
+    std::env::var("JARVIS_WHISPER_BEAM")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5)
 }
 
 /// Load (or return cached) WhisperContext. Idempotent.
@@ -43,7 +123,11 @@ fn get_or_init() -> Result<&'static WhisperContext> {
             path.display()
         ));
     }
-    tracing::info!("whisper: loading model from {}", path.display());
+    tracing::info!(
+        "whisper: loading model from {} ({})",
+        path.display(),
+        if model_is_english_only(&path) { "english-only" } else { "multilingual" }
+    );
     let mut params = WhisperContextParameters::default();
     params.use_gpu = true; // Metal on macOS
     let ctx = WhisperContext::new_with_params(
@@ -92,9 +176,19 @@ pub fn transcribe(samples: &[f32], sample_rate: u32, channels: u16) -> Result<St
         .create_state()
         .map_err(|e| anyhow!("whisper state: {e}"))?;
 
-    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    // Beam search beats greedy on accented speech; fall back to greedy if the
+    // user pins JARVIS_WHISPER_BEAM=1.
+    let strategy = match beam_size() {
+        n if n > 1 => SamplingStrategy::BeamSearch { beam_size: n, patience: -1.0 },
+        _ => SamplingStrategy::Greedy { best_of: 1 },
+    };
+    let mut params = FullParams::new(strategy);
     params.set_n_threads(num_cpus());
     params.set_language(Some("en"));
+    // Bias decoding toward known proper nouns (names, apps, tech terms) so they
+    // aren't mistranscribed — the biggest win for "when I say names". Per-call
+    // and independent of `no_context` below.
+    params.set_initial_prompt(&initial_prompt());
     params.set_translate(false);
     params.set_print_special(false);
     params.set_print_progress(false);
