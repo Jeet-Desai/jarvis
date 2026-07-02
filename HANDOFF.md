@@ -1,12 +1,63 @@
 # HANDOFF — next session starts here
 
-> **As of 2026-06-30 — voice I/O overhaul on `main` (UNCOMMITTED).**
-> The most recent work is the "## 🎙️ Voice I/O overhaul" section directly below — start there.
+> **As of 2026-07-02 — NEXT TASK: agent → terminal handoff.**
+> **Read [`docs/agent-terminal-handoff-plan.md`](docs/agent-terminal-handoff-plan.md)** — a
+> researched, staged plan (user-requested, high priority): a HUD button + voice command that
+> opens a dev agent's Claude Code session in a real terminal (`claude --resume <session-id>`
+> from its worktree) so the user can steer it manually, with take-over/fork/re-adopt semantics.
+> Start at Stage 1 (sidecar session-id capture in `manager.py`'s drain loop).
+>
+> Also new on `main` (2026-07-02, UNCOMMITTED — commit when asked, no Co-Authored-By):
+> the HUD redesign (CORE/AGENTS/MINI, memory `jarvis-hud-redesign`), voice-reactive speaking
+> animation (real TTS envelope → `jarvis:level`), the TTS pronunciation layer
+> (`kokoro.rs::respell_oov` OOV compound-splitting + adjective-"live" phoneme splice +
+> `JARVIS_TTS_RESPELL` env), chunk-pacing fix (`CHUNK_TARGET_EARLY`), and the AGENTS
+> detail-panel console now fetching FULL history via `jarvis_agent_status` →
+> `get_agent_status(full=true)` (roster `last` stays 200 chars; console gets 100×2000).
 > Read the auto-loaded memory notes first (`MEMORY.md` index → especially
-> `jarvis-voice-io-overhaul` (newest, covers this work), `jarvis-browser-control-playwright`,
-> `jarvis-subscription-brain`, `jarvis-3-dev-orchestrator`, `jarvis-qa-judge-on-claude`,
-> `jarvis-protected-paths-rule`, `jarvis-no-coauthor-commits`).
-> (Browser control + P2/P3/P3b sections lower down are older history — all DONE.)
+> `jarvis-hud-redesign` (newest), `jarvis-voice-io-overhaul`, `jarvis-subscription-brain`,
+> `jarvis-3-dev-orchestrator`, `jarvis-protected-paths-rule`, `jarvis-no-coauthor-commits`).
+> (Voice I/O overhaul + browser control + P2/P3/P3b sections below are older history — all DONE.)
+
+## ☑️ Pending LIVE validation (2026-07-02 work — needs the user's ears/eyes)
+
+The app is built + installed + running, all checks green (tsc, vite, cargo, 40/40 tests,
+headless-browser visual QA), but these can only be confirmed in real use:
+
+1. **TTS by ear**: say something that makes Jarvis speak "worktree / hardcoded / config"
+   (should be words, not letters), "the deploy is live" (/laɪv/) vs "I live in Mumbai"
+   (/lɪv/), and a long multi-sentence reply (the pause after the first full stop should
+   be small now). If a word still letter-spells → add it to `JARVIS_TTS_RESPELL` in `.env`
+   (no rebuild) and/or extend the map in `kokoro.rs::build_engine`. Watch
+   `/tmp/jarvis-dev.log` for `kokoro: N unknown token(s)` (= audibly dropped content) and
+   `tts: chunk i: Xms synth → Ys audio` (synth > previous chunk's audio = gap culprit).
+2. **Speaking animation**: equalizer should pulse WITH the voice (real envelope), no
+   dark/glow strobing. Brightness floor is in `reactor.ts` (drive floor 0.35).
+3. **AGENTS console**: spawn a real agent (+ SPAWN AGENT button or voice), open its detail
+   panel — LIVE OUTPUT should show full multi-line history (fetched via
+   `jarvis_agent_status`, polls 2.5s), not 200-char fragments. Also exercise INSTRUCT
+   and ■ STOP buttons against a live agent (they call the sidecar directly — first real
+   use). NOTE: sidecar history starts at the app relaunch; agents spawned before it
+   have thin history.
+4. **MINI orb**: chips only when non-zero, small pill, no NOW line; window is 360×400 —
+   re-snap position with ⌘⇧1-4 if the old saved position looks off.
+
+## 📌 Open items / debt (beyond the NEXT TASK above)
+
+- **`docs/ROADMAP.md` (NEW this session)** — the full prioritized roadmap (Horizons 1-3:
+  robustness → memory/routines/remote-approvals → moonshots). Terminal handoff is its
+  "Horizon 1.5". Pick from Horizon 1 after the handoff feature ships.
+- TTS edges that remain by design: unsplittable pronounceable OOV words still
+  letter-spell (escape hatch = `JARVIS_TTS_RESPELL`); `say`-fallback path has no real
+  envelope (uses synthetic cadence); afplay spawn adds ~100-200ms between chunks
+  (gapless rodio playback is a possible future upgrade).
+- Backlog carried over: persistent brain session + streaming brain→TTS, per-action
+  `can_use_tool` gating for dev agents, real-browser (Comet) control, Windows port,
+  wake-word latency (openWakeWord/Porcupine), real AEC barge-in.
+- Everything 2026-07-02 is **UNCOMMITTED** (one big working set: HUD redesign + TTS
+  fixes + console fix + docs). Commit when the user asks — plain message, no
+  `Co-Authored-By`. Deps changed: +`@fontsource/jetbrains-mono`, −`three`,
+  −`postprocessing`, −`@types/three` (package.json/pnpm-lock).
 
 ## 🎙️ Voice I/O overhaul — clean TTS text, better STT, Kokoro neural voice (2026-06-30, UNCOMMITTED)
 
