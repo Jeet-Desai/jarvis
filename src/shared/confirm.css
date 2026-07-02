@@ -33,11 +33,11 @@
   border: 1px solid var(--danger, var(--jarvis-cyan));
   border-radius: 6px;
   padding: 20px 22px 18px;
-  font-family: "SF Mono", "JetBrains Mono", "Menlo", monospace;
+  font-family: var(--jarvis-font);
   box-shadow:
     0 0 0 1px rgba(2, 8, 14, 0.6),
     0 0 40px color-mix(in srgb, var(--danger, var(--jarvis-cyan)) 28%, transparent),
-    inset 0 0 28px rgba(65, 227, 255, 0.06);
+    inset 0 0 28px rgba(95, 233, 245, 0.06);
   animation: jv-rise 160ms ease-out;
 }
 
@@ -102,13 +102,13 @@
   transition: box-shadow 120ms ease, border-color 120ms ease, background 120ms ease;
 }
 .jv-btn-approve {
-  border: 1px solid color-mix(in srgb, #4dff9e 55%, transparent);
-  color: #b6ffd5;
+  border: 1px solid color-mix(in srgb, var(--jarvis-cyan) 55%, transparent);
+  color: var(--jarvis-cyan);
 }
 .jv-btn-approve:hover {
-  border-color: #4dff9e;
-  background: rgba(77, 255, 158, 0.08);
-  box-shadow: 0 0 16px rgba(77, 255, 158, 0.35);
+  border-color: var(--jarvis-cyan);
+  background: rgba(95, 233, 245, 0.08);
+  box-shadow: 0 0 16px rgba(95, 233, 245, 0.35);
 }
 .jv-btn-deny {
   border: 1px solid color-mix(in srgb, var(--jarvis-red) 55%, transparent);
@@ -152,7 +152,7 @@
   border: 1px solid var(--danger, var(--jarvis-cyan));
   border-radius: 6px;
   padding: 10px 14px;
-  font-family: "SF Mono", "JetBrains Mono", "Menlo", monospace;
+  font-family: var(--jarvis-font);
   box-shadow: 0 0 26px color-mix(in srgb, var(--danger, var(--jarvis-cyan)) 30%, transparent);
 }
 .jv-confirm-orb-badge {
@@ -201,7 +201,7 @@
   padding: 4px 8px;
   border-radius: 3px;
   background: rgba(8, 22, 34, 0.45);
-  border: 1px solid rgba(65, 227, 255, 0.12);
+  border: 1px solid rgba(95, 233, 245, 0.12);
   animation: jv-fade-in 160ms ease-out;
 }
 .jv-activity-glyph {
@@ -212,7 +212,7 @@
 }
 .jv-glyph-awaiting { color: var(--jarvis-amber); }
 .jv-glyph-running  { color: var(--jarvis-cyan); animation: jv-pulse 1.1s ease-in-out infinite; }
-.jv-glyph-ok       { color: #4dff9e; }
+.jv-glyph-ok       { color: #5e7c86; }
 .jv-glyph-error    { color: var(--jarvis-red); }
 .jv-glyph-denied   { color: rgba(229, 246, 255, 0.4); }
 
@@ -243,7 +243,7 @@
   padding: 5px 8px;
   border-radius: 3px;
   background: rgba(8, 22, 34, 0.45);
-  border: 1px solid rgba(65, 227, 255, 0.12);
+  border: 1px solid rgba(95, 233, 245, 0.12);
   animation: jv-fade-in 160ms ease-out;
 }
 .jv-agent-head {

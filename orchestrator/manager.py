@@ -320,7 +320,7 @@ class Agent:
     cost_usd: float = 0.0
     turns: int = 0
     last_text: str = ""
-    events: deque = field(default_factory=lambda: deque(maxlen=50))
+    events: deque = field(default_factory=lambda: deque(maxlen=200))
     drain_task: Optional[asyncio.Task] = None
     created: float = field(default_factory=time.time)
     # ── closed-loop QA (P3b) ──
@@ -779,11 +779,15 @@ class AgentManager:
             merged[aid] = a.summary()                   # live, live=True
         return sorted(merged.values(), key=lambda r: r.get("created", 0), reverse=True)
 
-    def status(self, agent_id: str) -> dict:
+    def status(self, agent_id: str, full: bool = False) -> dict:
+        # Two consumers, two budgets: the BRAIN gets a compact view (15 events,
+        # 240 chars each — it rides into the LLM context), while the HUD detail
+        # panel asks full=True for real history (100 events, 2000 chars).
+        n, cap = (100, 2000) if full else (15, 240)
         if agent_id in self.agents:
             agent = self.agents[agent_id]
             s = agent.summary()
-            s["events"] = list(agent.events)[-15:]
+            s["events"] = [{**e, "text": e["text"][:cap]} for e in list(agent.events)[-n:]]
             return s
         # Detached agent from a previous run: serve its last-known record. Its
         # live event deque is gone, so events is empty.
@@ -829,7 +833,9 @@ class AgentManager:
             self._event(agent, "error", repr(e))
 
     def _event(self, agent: Agent, kind: str, text: str) -> None:
-        agent.events.append({"t": round(time.time(), 1), "kind": kind, "text": text[:240]})
+        # Store generous text (the HUD console shows it via status(full=True));
+        # brain-facing and log views re-truncate at serve time.
+        agent.events.append({"t": round(time.time(), 1), "kind": kind, "text": text[:2000]})
         # Mirror to the tailable log so the build is observable live.
         log.info("[%s/%s] %-9s | %s", agent.name, agent.id, kind, text[:240].replace("\n", " "))
 

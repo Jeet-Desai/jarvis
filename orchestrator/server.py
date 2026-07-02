@@ -40,10 +40,12 @@ def list_dev_agents() -> list:
 
 
 @mcp.tool()
-def get_agent_status(agent_id: str) -> dict:
+def get_agent_status(agent_id: str, full: bool = False) -> dict:
     """Detailed status for one agent: state, cost, turn count, and recent events
-    (what it has been saying and which tools it has used)."""
-    return manager.status(agent_id)
+    (what it has been saying and which tools it has used). `full=true` returns a
+    much longer, untruncated event history — meant for the HUD console, not for
+    reading into a model context."""
+    return manager.status(agent_id, full)
 
 
 @mcp.tool()

@@ -1,10 +1,24 @@
+/*
+ * Design tokens — from the JARVIS HUD design handoff
+ * (~/claude/design_handoff_jarvis_hud). Single source of truth for the
+ * palette; confirm.css / hud.css / orb.css all lean on these vars.
+ */
 :root {
-  --jarvis-cyan: #41e3ff;
-  --jarvis-cyan-dim: #1c8aa8;
-  --jarvis-amber: #ffb347;
-  --jarvis-red: #ff5050;
-  --jarvis-bg: rgba(4, 12, 20, 0.55);
-  --jarvis-glass: rgba(20, 35, 50, 0.35);
+  --jarvis-cyan: #5fe9f5;
+  --jarvis-cyan-soft: #9fd6de;
+  --jarvis-cyan-bright: #cfeef3;
+  --jarvis-cyan-dim: #5a7884;
+  --jarvis-text: #bfe9f0;
+  --jarvis-text-hi: #eafcff;
+  --jarvis-amber: #ffb84d;
+  --jarvis-red: #ff6b5e;
+  --jarvis-blue: #8fb9ff;
+  --jarvis-line: rgba(95, 233, 245, 0.12);
+  --jarvis-panel: rgba(8, 16, 24, 0.7);
+  --jarvis-panel-2: rgba(7, 15, 22, 0.55);
+  --jarvis-console: rgba(3, 7, 11, 0.6);
+  --jarvis-dark-on-cyan: #04161b;
+  --jarvis-font: "JetBrains Mono", "SF Mono", "Menlo", ui-monospace, monospace;
 }
 
 * {
@@ -12,16 +26,37 @@
 }
 
 button {
-  background: transparent;
-  border: 1px solid var(--jarvis-cyan-dim);
-  color: var(--jarvis-cyan);
   font-family: inherit;
-  padding: 6px 12px;
   cursor: pointer;
-  border-radius: 4px;
 }
 
-button:hover {
-  border-color: var(--jarvis-cyan);
-  box-shadow: 0 0 12px rgba(65, 227, 255, 0.4);
+/* Shared keyframes (design handoff §Design Tokens → Keyframes) */
+@keyframes jv-spin {
+  to { transform: rotate(360deg); }
+}
+@keyframes jv-spin-slow {
+  to { transform: rotate(-360deg); }
+}
+@keyframes jv-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+@keyframes jv-pulse-soft {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+@keyframes jv-scan {
+  from { background-position: 0 0; }
+  to { background-position: 0 5px; }
+}
+@keyframes jv-spawn-pop {
+  0% { transform: translate(-50%, -50%) scale(0); opacity: 0; }
+  55% { transform: translate(-50%, -50%) scale(1.4); opacity: 1; }
+  100% { transform: translate(-50%, -50%) scale(1); }
+}
+@keyframes jv-float-dust {
+  0% { transform: translateY(0); opacity: 0; }
+  12% { opacity: 0.55; }
+  88% { opacity: 0.55; }
+  100% { transform: translateY(-46px); opacity: 0; }
 }

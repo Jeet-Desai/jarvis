@@ -94,6 +94,83 @@ fn jarvis_policy_mode() -> String {
     policy::global().mode.as_str().to_string()
 }
 
+// Dev-agent controls for the HUD AGENTS space. These are DIRECT user actions
+// (button presses) — the same trust level as the global hotkeys — so they call
+// the orchestrator sidecar without routing through the brain or the policy
+// gate (the roster poll thread already talks to it the same way). They are
+// async + spawn_blocking because `orchestrator_call` does a `block_on` on the
+// MCP runtime, which must never run on the main thread (it would freeze the
+// run loop that input marshalling depends on) nor on an async worker.
+
+#[tauri::command]
+async fn jarvis_agent_spawn(task: String) -> Result<String, String> {
+    let task = task.trim().to_string();
+    if task.is_empty() {
+        return Err("empty task".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let mgr = mcp::global().ok_or_else(|| "Dev-agent orchestrator is not running".to_string())?;
+        tracing::info!("hud: spawn dev agent — {task}");
+        mgr.orchestrator_call("spawn_dev_agent", serde_json::json!({ "task": task }))
+            .map(|v| v.to_string())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn jarvis_agent_stop(agent_id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mgr = mcp::global().ok_or_else(|| "Dev-agent orchestrator is not running".to_string())?;
+        tracing::info!("hud: stop dev agent {agent_id}");
+        mgr.orchestrator_call("stop_dev_agent", serde_json::json!({ "agent_id": agent_id }))
+            .map(|v| v.to_string())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Full event history for the AGENTS detail-panel console. `full=true` on the
+/// sidecar returns ~100 events at up to 2000 chars each — far beyond the
+/// compact roster `last` (200 chars), which is why the console fetches this
+/// instead of accumulating roster fragments.
+#[tauri::command]
+async fn jarvis_agent_status(agent_id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mgr = mcp::global().ok_or_else(|| "Dev-agent orchestrator is not running".to_string())?;
+        mgr.orchestrator_call(
+            "get_agent_status",
+            serde_json::json!({ "agent_id": agent_id, "full": true }),
+        )
+        .map(|v| v.to_string())
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn jarvis_agent_instruct(agent_id: String, instruction: String) -> Result<String, String> {
+    let instruction = instruction.trim().to_string();
+    if instruction.is_empty() {
+        return Err("empty instruction".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let mgr = mcp::global().ok_or_else(|| "Dev-agent orchestrator is not running".to_string())?;
+        tracing::info!("hud: instruct dev agent {agent_id}");
+        mgr.orchestrator_call(
+            "instruct_dev_agent",
+            serde_json::json!({ "agent_id": agent_id, "instruction": instruction }),
+        )
+        .map(|v| v.to_string())
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Dev-agent orchestrator helpers (Phase 1.2/1.3)
 // ──────────────────────────────────────────────────────────────────────────────
@@ -626,7 +703,11 @@ pub fn run() {
             toggle_close,
             jarvis_stop,
             jarvis_resolve_confirm,
-            jarvis_policy_mode
+            jarvis_policy_mode,
+            jarvis_agent_spawn,
+            jarvis_agent_stop,
+            jarvis_agent_instruct,
+            jarvis_agent_status
         ])
         .setup(move |app| {
             // Make the app handle globally reachable so tool handlers can emit

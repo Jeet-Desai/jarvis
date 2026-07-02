@@ -34,6 +34,12 @@ export interface AgentItem {
   cost_usd: number;
   turns: number;
   last: string;
+  /** Epoch seconds of spawn — drives the RUNTIME readout. */
+  created?: number;
+  /** false = detached record restored from the registry (not controllable). */
+  live?: boolean;
+  /** true while the self-correcting QA loop is driving this agent. */
+  qa_active?: boolean;
 }
 
 export const [state, setState] = createSignal<JarvisState>("idle");
@@ -54,6 +60,17 @@ export const [policyMode, setPolicyMode] = createSignal<string>("");
 /** Live dev-agent roster, refreshed ~every 2s by the backend poll task. */
 export const [agents, setAgents] = createSignal<AgentItem[]>([]);
 
+/** One event from an agent's history (manager.py `_event`). */
+export interface AgentEvent {
+  t: number;
+  kind: string; // say | tool | error | qa_loop | announce | spawn | instruct | stop
+  text: string;
+}
+
+/** Window-load timestamp — the HUD webview is created at app launch (hidden),
+ *  so this doubles as the app-uptime origin for the UPTIME readout. */
+export const appStartMs = Date.now();
+
 const MAX_ACTIVITY = 12;
 
 let initialized = false;
@@ -64,6 +81,22 @@ export async function initStateBridge() {
   // would otherwise cause each event to be handled twice).
   if (initialized) return;
   initialized = true;
+
+  // Browser preview (plain `pnpm dev` outside Tauri): no event bridge exists,
+  // so expose the setters for manual/QA driving and skip the listeners.
+  if (!("__TAURI_INTERNALS__" in window)) {
+    (window as unknown as Record<string, unknown>).__jarvisPreview = {
+      setState,
+      setLevel,
+      setTranscript,
+      setResponse,
+      setActivity,
+      setAgents,
+      setPendingConfirm,
+      setPolicyMode,
+    };
+    return;
+  }
 
   await listen<JarvisState>("jarvis:state", (e) => setState(e.payload));
   await listen<number>("jarvis:level", (e) => setLevel(e.payload));
@@ -112,5 +145,57 @@ export async function resolveConfirm(id: number, approved: boolean): Promise<voi
   } catch {
     // The backend also emits jarvis:confirm_resolved; if the invoke fails the
     // prompt stays up so the user can retry via hotkey.
+  }
+}
+
+/** Drive the assistant state machine (the CORE view's debug state buttons). */
+export async function setJarvisState(s: JarvisState): Promise<void> {
+  try {
+    await invoke("jarvis_set", { newState: s });
+  } catch {
+    // non-fatal — the buttons are a dev affordance
+  }
+}
+
+/** Switch to the MINI orb (toggle_hud shows the orb and hides the HUD). */
+export async function showMini(): Promise<void> {
+  try {
+    await invoke("toggle_hud");
+  } catch {
+    // ignore
+  }
+}
+
+/** Spawn a dev agent from the AGENTS space. Resolves when the sidecar has
+ *  created it (the roster poll then picks it up within ~2s). */
+export function spawnAgent(task: string): Promise<string> {
+  return invoke<string>("jarvis_agent_spawn", { task });
+}
+
+/** Stop a dev agent (keeps its worktree for review). */
+export function stopAgent(agentId: string): Promise<string> {
+  return invoke<string>("jarvis_agent_stop", { agentId });
+}
+
+/** Send a follow-up instruction to a live dev agent. */
+export function instructAgent(agentId: string, instruction: string): Promise<string> {
+  return invoke<string>("jarvis_agent_instruct", { agentId, instruction });
+}
+
+/** Fetch an agent's full status + event history for the detail console.
+ *  Returns null on any failure (orchestrator down, browser preview, …). */
+export async function fetchAgentStatus(
+  agentId: string,
+): Promise<{ events?: AgentEvent[] } | null> {
+  try {
+    const raw = await invoke<string>("jarvis_agent_status", { agentId });
+    let v: unknown = JSON.parse(raw);
+    // The MCP layer wraps tool replies as {"text": "<json>"} — unwrap it.
+    if (v && typeof v === "object" && "text" in (v as Record<string, unknown>)) {
+      v = JSON.parse((v as Record<string, string>).text);
+    }
+    return v as { events?: AgentEvent[] };
+  } catch {
+    return null;
   }
 }

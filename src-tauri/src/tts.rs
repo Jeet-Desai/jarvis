@@ -38,6 +38,11 @@ const DEFAULT_RATE_WPM: u32  = 195;
 const SINGLE_CHUNK_MAX: usize = 220;
 /// Pack streamed chunks up to ~this many chars → few sentence-boundary gaps.
 const CHUNK_TARGET: usize = 200;
+/// The SECOND chunk stays small: chunk 1 is a single sentence (fast first
+/// audio), so if chunk 2 were full-size its synthesis could outlast chunk 1's
+/// playback — an audible dead gap right after the first full stop. A small
+/// second chunk keeps synth ahead of playback while the pipeline ramps up.
+const CHUNK_TARGET_EARLY: usize = 110;
 /// Per-clip playback ceiling (s) so a wedged `afplay`/`say` can't hang a turn.
 const CLIP_CEILING_SECS: u64 = 90;
 
@@ -60,7 +65,11 @@ impl SpeechInner {
 
     /// Spawn a player child, register its pid, and block until it exits, until
     /// `cancel` is set, or until the ceiling elapses (poll so kill stays snappy).
-    fn play(&self, mut cmd: Command, ceiling_secs: u64) {
+    ///
+    /// `envelope` (one loudness value per `kokoro::ENV_DT_MS` of audio) is
+    /// replayed as `jarvis:level` events in step with the playback clock, so
+    /// the orb's speaking equalizer pulses with the actual voice.
+    fn play(&self, mut cmd: Command, ceiling_secs: u64, envelope: Option<&[f32]>) {
         if self.cancelled() {
             return;
         }
@@ -75,7 +84,15 @@ impl SpeechInner {
         let mut child = child;
         let start = Instant::now();
         let max = Duration::from_secs(ceiling_secs.max(1));
+        let mut env_idx = usize::MAX;
         loop {
+            if let Some(env) = envelope {
+                let idx = (start.elapsed().as_millis() as u64 / crate::kokoro::ENV_DT_MS) as usize;
+                if idx != env_idx && idx < env.len() {
+                    env_idx = idx;
+                    emit_level(env[idx]);
+                }
+            }
             if self.cancelled() {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -95,7 +112,19 @@ impl SpeechInner {
                 Err(_) => break,
             }
         }
+        if envelope.is_some() {
+            emit_level(0.0);
+        }
         *self.current_pid.lock() = None;
+    }
+}
+
+/// Broadcast a live speech loudness value to the UI (drives the speaking
+/// equalizer). Best-effort — no app handle (tests) means no event, that's fine.
+fn emit_level(v: f32) {
+    if let Some(app) = crate::gate::app() {
+        use tauri::Emitter;
+        let _ = app.emit("jarvis:level", v);
     }
 }
 
@@ -186,7 +215,7 @@ fn speak_kokoro_streaming(text: &str) -> Option<SpeechHandle> {
     let join = thread::spawn(move || {
         // Synth-ahead-by-one: buffer of 1 keeps the producer at most one chunk
         // in front of playback (bounded disk/memory, hides synth latency).
-        let (tx, rx) = sync_channel::<PathBuf>(1);
+        let (tx, rx) = sync_channel::<(PathBuf, Vec<f32>)>(1);
         let inner_prod = inner_co.clone();
         let producer = thread::spawn(move || {
             for (i, chunk) in chunks.iter().enumerate() {
@@ -194,9 +223,18 @@ fn speak_kokoro_streaming(text: &str) -> Option<SpeechHandle> {
                     break;
                 }
                 let path = chunk_path(i);
+                let t0 = Instant::now();
                 match crate::kokoro::synth_to_wav(chunk, &path) {
-                    Ok(Some(_dur)) => {
-                        if tx.send(path).is_err() {
+                    Ok(Some(clip)) => {
+                        // If synth-ms regularly exceeds the PREVIOUS chunk's
+                        // audio-secs, playback gaps appear — this log is the
+                        // diagnosis path for "pauses between sentences".
+                        tracing::info!(
+                            "tts: chunk {i}: {}ms synth → {:.1}s audio",
+                            t0.elapsed().as_millis(),
+                            clip.duration_secs
+                        );
+                        if tx.send((path, clip.envelope)).is_err() {
                             break; // consumer gone
                         }
                     }
@@ -213,10 +251,10 @@ fn speak_kokoro_streaming(text: &str) -> Option<SpeechHandle> {
                 break;
             }
             match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(path) => {
+                Ok((path, envelope)) => {
                     let mut cmd = Command::new("afplay");
                     cmd.arg(&path);
-                    inner_co.play(cmd, CLIP_CEILING_SECS);
+                    inner_co.play(cmd, CLIP_CEILING_SECS, Some(&envelope));
                 }
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -246,7 +284,9 @@ fn speak_say(text: &str) -> SpeechHandle {
 
     let inner = Arc::new(SpeechInner::new());
     let inner_co = inner.clone();
-    let join = thread::spawn(move || inner_co.play(cmd, ceiling));
+    // `say` synthesizes internally — no envelope; the orb uses its synthetic
+    // speech cadence instead.
+    let join = thread::spawn(move || inner_co.play(cmd, ceiling, None));
     SpeechHandle::spawn(inner, join)
 }
 
@@ -274,9 +314,11 @@ fn split_into_chunks(text: &str) -> Vec<String> {
             buf.push(' ');
         }
         buf.push_str(s);
-        // First chunk = the opening sentence (fast first audio); later chunks
-        // pack whole sentences up to ~CHUNK_TARGET to minimise gaps.
-        let flush = if chunks.is_empty() { true } else { buf.chars().count() >= CHUNK_TARGET };
+        // First chunk = the opening sentence (fast first audio); the second
+        // stays small so its synth beats chunk 1's playback (no gap after the
+        // first full stop); later chunks pack up to ~CHUNK_TARGET.
+        let target = if chunks.len() == 1 { CHUNK_TARGET_EARLY } else { CHUNK_TARGET };
+        let flush = if chunks.is_empty() { true } else { buf.chars().count() >= target };
         if flush {
             chunks.push(std::mem::take(&mut buf));
         }

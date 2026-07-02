@@ -1,10 +1,8 @@
 /*
- * The orb window is a fully transparent rectangle. The Three.js sphere renders
- * only inside its projected silhouette — outside the sphere, pixels stay
- * transparent (clear color alpha = 0). No CSS clipping, no drop-shadows, no
- * extra elements: the shape you see is literally the rendered sphere, and
- * the chunky speaking animation can extend freely past the sphere's rest
- * radius without being clipped by any rectangle.
+ * MINI orb window — fully transparent background; the reactor renders on a
+ * transparent Canvas2D, and the pill/chips/NOW line float beneath it (design
+ * handoff §3). The whole window is a drag region; nothing here is clickable
+ * (the NSPanel can't become key), so all elements are display-only.
  */
 .orb-root {
   position: relative;
@@ -14,25 +12,105 @@
   display: block;
   -webkit-app-region: drag;
   cursor: grab;
+  font-family: var(--jarvis-font);
+  overflow: hidden;
 }
 
 .orb-root:active {
   cursor: grabbing;
 }
 
-.orb-label {
+.mini-stack {
   position: absolute;
-  bottom: 14px;
-  left: 0;
-  right: 0;
-  text-align: center;
-  font-size: 9px;
-  letter-spacing: 3px;
-  text-transform: uppercase;
-  color: var(--jarvis-cyan);
-  opacity: 0.45;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding-top: 4px;
   pointer-events: none;
-  text-shadow: 0 0 8px rgba(65, 227, 255, 0.7);
-  font-weight: 500;
-  z-index: 10;
+}
+
+.mini-orb {
+  width: 280px;
+  height: 280px;
+  flex: none;
+}
+
+.mini-pill {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border: 1px solid var(--jarvis-cyan);
+  border-radius: 3px;
+  background: rgba(6, 14, 20, 0.4);
+  box-shadow: 0 0 12px rgba(95, 233, 245, 0.1);
+  margin-top: -14px;
+}
+.mini-pill-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  animation: jv-pulse-soft 1.4s ease infinite;
+}
+.mini-pill-text {
+  font-weight: 700;
+  letter-spacing: 2.5px;
+  font-size: 9px;
+  color: var(--jarvis-text-hi);
+}
+
+.mini-chips {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 7px;
+  margin-top: 14px;
+  max-width: 340px;
+}
+.mini-chip {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 9px;
+  border-radius: 3px;
+  font-size: 9px;
+  letter-spacing: 1px;
+  background: rgba(6, 14, 20, 0.35);
+}
+.mini-chip-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+.mini-chip.working {
+  border: 1px solid rgba(95, 233, 245, 0.18);
+  color: var(--jarvis-cyan-soft);
+}
+.mini-chip.working .mini-chip-dot {
+  background: var(--jarvis-cyan);
+  animation: jv-pulse-soft 1.3s ease infinite;
+}
+.mini-chip.idle {
+  border: 1px solid rgba(94, 124, 134, 0.3);
+  color: #7e9aa3;
+}
+.mini-chip.idle .mini-chip-dot {
+  background: #5e7c86;
+}
+.mini-chip.err {
+  border: 1px solid rgba(255, 107, 94, 0.22);
+  color: var(--jarvis-red);
+}
+.mini-chip.err .mini-chip-dot {
+  background: var(--jarvis-red);
+  animation: jv-blink 1s steps(1) infinite;
+}
+.mini-chip.qa {
+  border: 1px solid rgba(255, 184, 77, 0.22);
+  color: var(--jarvis-amber);
+}
+.mini-chip.qa .mini-chip-dot {
+  background: var(--jarvis-amber);
+  animation: jv-pulse-soft 1.3s ease infinite;
 }
