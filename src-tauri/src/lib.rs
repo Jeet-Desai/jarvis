@@ -698,6 +698,14 @@ pub fn run() {
                                 tracing::info!("hotkey: Y — approved pending action");
                             }
                         }
+                        // Quit — Windows/Linux only (no taskbar entry to close
+                        // from; on macOS Cmd+Shift+Q is the system logout
+                        // shortcut, so it is never registered there).
+                        #[cfg(not(target_os = "macos"))]
+                        Code::KeyQ => {
+                            tracing::info!("hotkey: Q — quit Jarvis");
+                            app.exit(0);
+                        }
                         _ => {}
                     }
                 })
@@ -930,6 +938,8 @@ pub fn run() {
                 Code::Digit4,
                 Code::KeyP,
                 Code::KeyY,
+                #[cfg(not(target_os = "macos"))]
+                Code::KeyQ,
             ] {
                 if gs.register(Shortcut::new(Some(mods), code)).is_ok() {
                     continue;
@@ -1016,6 +1026,10 @@ pub fn run() {
             let mod_label = "Cmd+Shift";
             #[cfg(not(target_os = "macos"))]
             let mod_label = "Ctrl+Alt";
+            #[cfg(target_os = "macos")]
+            let quit_hint = "";
+            #[cfg(not(target_os = "macos"))]
+            let quit_hint = " | Ctrl+Alt+Q quit";
             tracing::info!(
                 "Jarvis ready.  Hotkeys: \
                  {m}+J on/off | \
@@ -1025,8 +1039,9 @@ pub fn run() {
                  {m}+R reset | \
                  {m}+(+/-) brightness | \
                  {m}+(1..4) corner | \
-                 {m}+P preview (dev)",
-                m = mod_label
+                 {m}+P preview (dev){q}",
+                m = mod_label,
+                q = quit_hint
             );
             Ok(())
         })

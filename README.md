@@ -76,7 +76,7 @@ The whole feature set works on Windows with these platform differences:
 
 | | macOS | Windows |
 |---|---|---|
-| Hotkey modifier | `⇧⌘` (Cmd+Shift) | `Ctrl+Alt` (e.g. `Ctrl+Alt+J` toggle, `Ctrl+Alt+S` stop, `Ctrl+Alt+Y` approve) |
+| Hotkey modifier | `⇧⌘` (Cmd+Shift) | `Ctrl+Alt` (e.g. `Ctrl+Alt+J` toggle, `Ctrl+Alt+S` stop, `Ctrl+Alt+Y` approve, `Ctrl+Alt+Q` quit; a combo another app owns is auto-registered with an extra Shift) |
 | STT | whisper.cpp on Metal (`large-v3-turbo` default) | whisper.cpp on CPU (`base.en` default — set `JARVIS_WHISPER_MODEL=small` on a fast CPU) |
 | TTS | Kokoro → `say` fallback | Kokoro → Windows SAPI fallback |
 | Browser context | AppleScript | UI Automation (address bar + document text; Firefox works here too) |
