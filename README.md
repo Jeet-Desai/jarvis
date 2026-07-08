@@ -1,8 +1,8 @@
 # Jarvis
 
-A Tony Stark-style voice assistant for macOS. Always-on wake word, a holographic orb that overlays every screen (even fullscreen apps), pluggable LLM brain with automatic fallback, conversational memory, browser-context awareness, and a HUD reminiscent of Iron Man's helmet.
+A Tony Stark-style voice assistant for macOS **and Windows**. Always-on wake word, a holographic orb that overlays every screen (even fullscreen apps), pluggable LLM brain with automatic fallback, conversational memory, browser-context awareness, and a HUD reminiscent of Iron Man's helmet.
 
-> **v1 status: macOS only.** Apple Silicon recommended. Built in Tauri 2 + Rust + SolidJS + Three.js.
+> **Status: macOS (primary, Apple Silicon recommended) + Windows 10/11 (ported).** Built in Tauri 2 + Rust + SolidJS + Three.js. See "Windows" below for the Windows specifics.
 
 ---
 
@@ -64,8 +64,41 @@ config dir for fine-grained allow/deny lists:
 
 > **Cross-platform:** the control layer, policy engine, confirmation flow, and UI are
 > OS-agnostic by design (trait-based platform seam in `src-tauri/src/control/`). macOS
-> is complete; the **Windows** port (UI Automation backend + platform shims) is the
-> next milestone — see `control/windows.rs`.
+> is complete, and the **Windows port is implemented**: UI Automation backend
+> (`control/windows.rs`), native clipboard, `xcap` screenshots, rodio/Kokoro TTS with a
+> SAPI fallback, Win32 app focus/list/quit, and browser context read via UIA.
+
+---
+
+## Windows
+
+The whole feature set works on Windows with these platform differences:
+
+| | macOS | Windows |
+|---|---|---|
+| Hotkey modifier | `⇧⌘` (Cmd+Shift) | `Ctrl+Alt` (e.g. `Ctrl+Alt+J` toggle, `Ctrl+Alt+S` stop, `Ctrl+Alt+Y` approve) |
+| STT | whisper.cpp on Metal (`large-v3-turbo` default) | whisper.cpp on CPU (`base.en` default — set `JARVIS_WHISPER_MODEL=small` on a fast CPU) |
+| TTS | Kokoro → `say` fallback | Kokoro → Windows SAPI fallback |
+| Browser context | AppleScript | UI Automation (address bar + document text; Firefox works here too) |
+| UI-tree reading | Accessibility API (AXUIElement) | UI Automation (`uiautomation` crate) |
+| Screenshot | `screencapture` + `sips` | `xcap` (no permission needed) |
+| `run_shell` | `sh -c` | `cmd /C` |
+| Permissions | Mic + Accessibility + Screen Recording (TCC) | Mic only (Settings → Privacy → Microphone) |
+| Overlay | NSPanel (over fullscreen apps + all Spaces) | Always-on-top layered window (won't cover exclusive-fullscreen games) |
+
+**Windows setup (10 minutes + first build):**
+
+```powershell
+git clone https://github.com/jeet-desai/jarvis.git
+cd jarvis
+# prerequisites (skip any you have): VS Build Tools C++, Rust, CMake, LLVM, Node
+winget install Microsoft.VisualStudio.2022.BuildTools --override "--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --passive"
+winget install Rustlang.Rustup Kitware.CMake LLVM.LLVM OpenJS.NodeJS.LTS
+# then, in a NEW terminal (fresh PATH):
+powershell -ExecutionPolicy Bypass -File setup.ps1   # downloads models, installs deps, creates .env
+notepad .env                                         # add at least one LLM key
+pnpm tauri dev                                       # first build is 10-20 min (whisper.cpp)
+```
 
 ---
 

@@ -361,6 +361,56 @@ fn ollama_vision(
     Ok(desc)
 }
 
+/// Windows capture: primary monitor via `xcap` (Graphics Capture / GDI under
+/// the hood), downscaled to a max edge of 1920 and JPEG-encoded at quality 85
+/// — the same shape `screencapture` + `sips` produce on macOS. No permission
+/// prompt exists on Windows; capture just works.
+#[cfg(target_os = "windows")]
+fn capture_screen() -> Result<PathBuf> {
+    use xcap::image::imageops::FilterType;
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("jarvis_screen_{ts}.jpg"));
+
+    let monitors = xcap::Monitor::all().map_err(|e| anyhow!("monitor enumeration: {e}"))?;
+    let monitor = monitors
+        .iter()
+        .find(|m| m.is_primary().unwrap_or(false))
+        .or_else(|| monitors.first())
+        .ok_or_else(|| anyhow!("no display found to capture"))?;
+    let img = monitor
+        .capture_image()
+        .map_err(|e| anyhow!("screen capture failed: {e}"))?;
+
+    // Downscale to max edge 1920 (small UI text stays legible, upload stays fast).
+    let (w, h) = (img.width(), img.height());
+    let max_edge = w.max(h);
+    let img = xcap::image::DynamicImage::ImageRgba8(img);
+    let img = if max_edge > 1920 {
+        let scale = 1920.0 / max_edge as f64;
+        img.resize(
+            (w as f64 * scale) as u32,
+            (h as f64 * scale) as u32,
+            FilterType::Triangle,
+        )
+    } else {
+        img
+    };
+
+    let rgb = img.to_rgb8();
+    let file = std::fs::File::create(&path)?;
+    let mut enc = xcap::image::codecs::jpeg::JpegEncoder::new_with_quality(
+        std::io::BufWriter::new(file),
+        85,
+    );
+    enc.encode_image(&rgb).map_err(|e| anyhow!("jpeg encode: {e}"))?;
+    Ok(path)
+}
+
+#[cfg(target_os = "macos")]
 fn capture_screen() -> Result<PathBuf> {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -408,6 +458,7 @@ fn capture_screen() -> Result<PathBuf> {
     Ok(path)
 }
 
+#[cfg(target_os = "macos")]
 fn open_screen_recording_settings() {
     let _ = std::process::Command::new("open")
         .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")

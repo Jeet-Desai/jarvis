@@ -12,7 +12,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::brain;
 use crate::control;
+use crate::platform;
 use crate::policy::{self, DangerLevel, Decision};
+
+/// The platform's primary modifier key, for tool descriptions the LLM reads.
+#[cfg(target_os = "macos")]
+const MODK: &str = "Cmd";
+#[cfg(not(target_os = "macos"))]
+const MODK: &str = "Ctrl";
 
 /// One callable tool: the LLM sees the `declaration`, and when it issues a tool
 /// call with this name we run `handler` (through `dispatch`, which enforces the
@@ -716,6 +723,7 @@ fn get_current_time(_args: &Value) -> Result<Value> {
 //   - One predictable TCC permission prompt per (Jarvis ↔ browser) pair
 // ──────────────────────────────────────────────────────────────────────────────
 
+#[cfg(target_os = "macos")]
 fn get_focused_app(_args: &Value) -> Result<Value> {
     let app = osascript(
         r#"tell application "System Events" to get name of first process whose frontmost is true"#,
@@ -723,6 +731,34 @@ fn get_focused_app(_args: &Value) -> Result<Value> {
     Ok(json!({ "front_app": app.trim() }))
 }
 
+#[cfg(target_os = "windows")]
+fn get_focused_app(_args: &Value) -> Result<Value> {
+    let (app, title) = control::windows::focused_app()?;
+    Ok(json!({ "front_app": app, "window_title": title }))
+}
+
+#[cfg(target_os = "windows")]
+fn get_browser_context(_args: &Value) -> Result<Value> {
+    match control::windows::browser_context()? {
+        Some(ctx) => Ok(json!({
+            "browser":      ctx.browser,
+            "url":          ctx.url,
+            "title":        ctx.title,
+            "text_preview": ctx.text,
+        })),
+        None => {
+            let front = control::windows::focused_app()
+                .map(|(a, _)| a)
+                .unwrap_or_else(|_| "unknown".into());
+            Ok(json!({
+                "error": format!("No browser is currently focused — the front app is '{front}'."),
+                "front_app": front,
+            }))
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn get_browser_context(_args: &Value) -> Result<Value> {
     let app = osascript(
         r#"tell application "System Events" to get name of first process whose frontmost is true"#,
@@ -792,6 +828,7 @@ fn get_browser_context(_args: &Value) -> Result<Value> {
     }))
 }
 
+#[cfg(target_os = "macos")]
 fn osascript(script: &str) -> Result<String> {
     let output = std::process::Command::new("osascript")
         .arg("-e")
@@ -813,6 +850,7 @@ fn osascript(script: &str) -> Result<String> {
 /// `get_browser_context`, so this is a real prompt-injection → RCE path.
 /// Escaping keeps the value confined to the string literal; a hostile name
 /// at worst yields "app not found", never code execution.
+#[cfg(target_os = "macos")]
 fn applescript_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
     for c in s.chars() {
@@ -962,8 +1000,6 @@ fn browser_tabs(args: &Value) -> Result<Value> { playwright_call("browser_tabs",
 // ──────────────────────────────────────────────────────────────────────────────
 
 fn type_text(args: &Value) -> Result<Value> {
-    use std::io::Write;
-
     let text = args
         .get("text")
         .and_then(|v| v.as_str())
@@ -977,40 +1013,35 @@ fn type_text(args: &Value) -> Result<Value> {
     let submit = args.get("submit").and_then(|v| v.as_bool()).unwrap_or(false);
 
     // Stash old clipboard so we can restore it after the paste.
-    let old_clip = std::process::Command::new("pbpaste")
-        .output()
-        .ok()
-        .map(|o| o.stdout);
+    let old_clip = read_clipboard_raw().ok();
 
     // Put our text on the clipboard.
     write_clipboard(text)?;
 
-    // Focus the target app if specified. Use Launch Services (open -a)
-    // so Catalyst / sandboxed apps work; AppleScript activate fails on them.
+    // Focus the target app if specified.
     if let Some(app) = app_name {
-        let _ = std::process::Command::new("open").arg("-a").arg(app).status();
+        focus_app_by_name(app)?;
         std::thread::sleep(std::time::Duration::from_millis(300));
     }
 
-    // Paste (⌘V).
+    // Paste (⌘V on macOS via System Events; Ctrl+V natively elsewhere).
+    #[cfg(target_os = "macos")]
     osascript(r#"tell application "System Events" to keystroke "v" using command down"#)?;
+    #[cfg(not(target_os = "macos"))]
+    control::press_keys("v", &["ctrl".to_string()])?;
 
     if submit {
         std::thread::sleep(std::time::Duration::from_millis(150));
-        // key code 36 = Return
-        osascript(r#"tell application "System Events" to key code 36"#)?;
+        #[cfg(target_os = "macos")]
+        osascript(r#"tell application "System Events" to key code 36"#)?; // Return
+        #[cfg(not(target_os = "macos"))]
+        control::press_keys("return", &[])?;
     }
 
     // Restore prior clipboard contents after the paste has had time to land.
     if let Some(old) = old_clip {
         std::thread::sleep(std::time::Duration::from_millis(300));
-        let mut child = std::process::Command::new("pbcopy")
-            .stdin(std::process::Stdio::piped())
-            .spawn()?;
-        if let Some(stdin) = child.stdin.as_mut() {
-            let _ = stdin.write_all(&old);
-        }
-        let _ = child.wait();
+        let _ = write_clipboard(&old);
     }
 
     Ok(json!({
@@ -1019,6 +1050,31 @@ fn type_text(args: &Value) -> Result<Value> {
         "submitted": submit,
         "chars": text.chars().count(),
     }))
+}
+
+/// Focus an app by name — the shared helper `type_text` and `focus_app` use.
+#[cfg(target_os = "macos")]
+fn focus_app_by_name(app: &str) -> Result<()> {
+    let _ = std::process::Command::new("open").arg("-a").arg(app).status();
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn focus_app_by_name(app: &str) -> Result<()> {
+    control::windows::focus_app(app).map(|_| ())
+}
+
+/// Raw clipboard read for the stash/restore dance (no length cap, no trim).
+#[cfg(target_os = "macos")]
+fn read_clipboard_raw() -> Result<String> {
+    let output = std::process::Command::new("pbpaste").output()?;
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(target_os = "windows")]
+fn read_clipboard_raw() -> Result<String> {
+    let mut cb = arboard::Clipboard::new()?;
+    Ok(cb.get_text().unwrap_or_default())
 }
 
 fn send_shortcut(args: &Value) -> Result<Value> {
@@ -1053,6 +1109,23 @@ fn set_clipboard(args: &Value) -> Result<Value> {
     Ok(json!({ "ok": true, "chars": text.chars().count() }))
 }
 
+#[cfg(target_os = "windows")]
+fn focus_app(args: &Value) -> Result<Value> {
+    let app = args
+        .get("app_name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("missing required field: app_name"))?;
+    match control::windows::focus_app(app) {
+        Ok(method) => {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            Ok(json!({ "ok": true, "focused": app, "method": method }))
+        }
+        Err(e) => Ok(json!({ "error": e.to_string() })),
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn focus_app(args: &Value) -> Result<Value> {
     let app = args
         .get("app_name")
@@ -1091,6 +1164,7 @@ fn focus_app(args: &Value) -> Result<Value> {
     }))
 }
 
+#[cfg(target_os = "macos")]
 fn write_clipboard(text: &str) -> Result<()> {
     use std::io::Write;
     let mut child = std::process::Command::new("pbcopy")
@@ -1103,16 +1177,19 @@ fn write_clipboard(text: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+fn write_clipboard(text: &str) -> Result<()> {
+    let mut cb = arboard::Clipboard::new()?;
+    cb.set_text(text.to_string())?;
+    Ok(())
+}
+
 fn get_clipboard(_args: &Value) -> Result<Value> {
-    let output = std::process::Command::new("pbpaste").output()?;
-    if !output.status.success() {
-        return Err(anyhow::anyhow!("pbpaste failed"));
-    }
-    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    let text = read_clipboard_raw()?;
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return Ok(json!({
-            "error": "Clipboard is empty. Ask the user to copy some text first (Cmd+A then Cmd+C), then call this tool again."
+            "error": format!("Clipboard is empty. Ask the user to copy some text first ({MODK}+A then {MODK}+C), then call this tool again.")
         }));
     }
     // Cap at ~8000 bytes (char-safe) to keep LLM payload sane
@@ -1159,6 +1236,7 @@ fn format_tz(offset_secs: i32) -> String {
     format!("{sign}{h:02}:{m:02}")
 }
 
+#[cfg(unix)]
 fn local_tz_offset_seconds() -> i32 {
     // Cheap & correct on macOS: ask libc for the difference between
     // gmtime and localtime of the same instant.
@@ -1172,8 +1250,14 @@ fn local_tz_offset_seconds() -> i32 {
     }
 }
 
+#[cfg(unix)]
 fn libc_time() -> libc::time_t {
     unsafe { libc::time(std::ptr::null_mut()) }
+}
+
+#[cfg(windows)]
+fn local_tz_offset_seconds() -> i32 {
+    control::windows::tz_offset_seconds()
 }
 
 // Convert unix seconds (already shifted to local) to (Y, M, D, h, m, s).
@@ -1288,6 +1372,7 @@ fn wait_tool(args: &Value) -> Result<Value> {
     Ok(json!({ "ok": true, "waited_ms": ms }))
 }
 
+#[cfg(target_os = "macos")]
 fn list_apps(_args: &Value) -> Result<Value> {
     let out = osascript(
         r#"tell application "System Events" to get name of every process whose background only is false"#,
@@ -1300,6 +1385,13 @@ fn list_apps(_args: &Value) -> Result<Value> {
     Ok(json!({ "apps": apps }))
 }
 
+#[cfg(target_os = "windows")]
+fn list_apps(_args: &Value) -> Result<Value> {
+    let apps = control::windows::list_app_names()?;
+    Ok(json!({ "apps": apps }))
+}
+
+#[cfg(target_os = "macos")]
 fn quit_app(args: &Value) -> Result<Value> {
     let app = args
         .get("app_name")
@@ -1310,6 +1402,17 @@ fn quit_app(args: &Value) -> Result<Value> {
         r#"tell application "{}" to quit"#,
         applescript_escape(app)
     ))?;
+    Ok(json!({ "ok": true, "quit": app }))
+}
+
+#[cfg(target_os = "windows")]
+fn quit_app(args: &Value) -> Result<Value> {
+    let app = args
+        .get("app_name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("missing required field: app_name"))?;
+    control::windows::quit_app(app)?;
     Ok(json!({ "ok": true, "quit": app }))
 }
 
@@ -1341,7 +1444,7 @@ fn list_dir(args: &Value) -> Result<Value> {
         .get("path")
         .and_then(|v| v.as_str())
         .map(expand_tilde)
-        .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+        .unwrap_or_else(platform::home_dir);
     let mut entries = Vec::new();
     for e in std::fs::read_dir(&path)
         .map_err(|e| anyhow::anyhow!("read_dir {path}: {e}"))?
@@ -1367,7 +1470,7 @@ fn search_files(args: &Value) -> Result<Value> {
         .get("dir")
         .and_then(|v| v.as_str())
         .map(expand_tilde)
-        .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+        .unwrap_or_else(platform::home_dir);
     let mut matches = Vec::new();
     search_walk(std::path::Path::new(&root), &query, 0, &mut matches);
     Ok(json!({ "query": query, "root": root, "matches": matches }))
@@ -1448,17 +1551,13 @@ fn shell_command() -> std::process::Command {
 fn shell_command() -> std::process::Command {
     let mut c = std::process::Command::new("cmd");
     c.arg("/C");
+    platform::hide_console(&mut c);
     c
 }
 
-#[cfg(unix)]
 fn kill_pid(pid: u32) {
-    unsafe {
-        libc::kill(pid as i32, libc::SIGKILL);
-    }
+    platform::kill_pid(pid);
 }
-#[cfg(not(unix))]
-fn kill_pid(_pid: u32) {}
 
 // ── small arg / text helpers ────────────────────────────────────────────────
 
@@ -1478,12 +1577,7 @@ fn path_arg(args: &Value) -> Result<String> {
 }
 
 fn expand_tilde(p: &str) -> String {
-    if let Some(rest) = p.strip_prefix("~/") {
-        if let Ok(h) = std::env::var("HOME") {
-            return format!("{h}/{rest}");
-        }
-    }
-    p.to_string()
+    platform::expand_home(p)
 }
 
 fn cap_chars(s: &str, max: usize) -> String {

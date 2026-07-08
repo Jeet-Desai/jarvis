@@ -18,7 +18,7 @@
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "windows")]
-mod windows;
+pub(crate) mod windows;
 
 use anyhow::{anyhow, Result};
 use enigo::{
@@ -250,7 +250,12 @@ pub fn click_ui_element(label: &str, role: Option<&str>) -> Result<UiElement> {
     if target.is_empty() {
         anyhow::bail!("click_ui_element needs a non-empty label");
     }
-    let role_lc = role.map(|r| r.to_lowercase());
+    // Normalize an "AXButton"-style role hint so it matches both the macOS
+    // ("AXButton") and Windows ("Button") role vocabularies.
+    let role_lc = role.map(|r| {
+        let lc = r.to_lowercase();
+        lc.strip_prefix("ax").map(str::to_string).unwrap_or(lc)
+    });
     let elements = read_ui_elements(400)?;
     let total = elements.len();
 

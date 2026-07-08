@@ -13,6 +13,7 @@ mod mcp;
 mod mcp_server;
 #[cfg(target_os = "macos")]
 mod permissions;
+mod platform;
 mod policy;
 mod speakable;
 mod state;
@@ -525,7 +526,8 @@ fn convert_to_panels(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> 
 /// Safe to mutate the process env here: this is the first thing `run()` does,
 /// on the main thread, before any other thread is spawned.
 fn augment_path_for_gui_launch() {
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = platform::home_dir();
+    #[cfg(target_os = "macos")]
     // User-local first (where `claude` installs), then Homebrew (Apple Silicon
     // + Intel), then language toolchains.
     let candidates = [
@@ -539,9 +541,32 @@ fn augment_path_for_gui_launch() {
         format!("{home}/.volta/bin"),
         format!("{home}/bin"),
     ];
+    // Windows GUI launches inherit the user PATH from the registry, so this is
+    // usually a no-op — but a shell-only PATH edit (or a fresh install that
+    // hasn't been re-logged-in) still benefits from the common tool dirs.
+    #[cfg(target_os = "windows")]
+    let candidates = [
+        format!("{home}\\.local\\bin"),
+        format!("{home}\\.cargo\\bin"),
+        std::env::var("APPDATA").map(|a| format!("{a}\\npm")).unwrap_or_default(),
+        std::env::var("LOCALAPPDATA").map(|a| format!("{a}\\pnpm")).unwrap_or_default(),
+        std::env::var("LOCALAPPDATA")
+            .map(|a| format!("{a}\\Microsoft\\WindowsApps"))
+            .unwrap_or_default(),
+    ];
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let candidates = [
+        format!("{home}/.local/bin"),
+        "/usr/local/bin".to_string(),
+        format!("{home}/.cargo/bin"),
+    ];
     let existing = std::env::var("PATH").unwrap_or_default();
-    let (new_path, added) =
-        compute_path_augmentation(&existing, &candidates, |d| std::path::Path::new(d).is_dir());
+    let (new_path, added) = compute_path_augmentation(
+        &existing,
+        &candidates,
+        PATH_LIST_SEPARATOR,
+        |d| std::path::Path::new(d).is_dir(),
+    );
     if !added.is_empty() {
         std::env::set_var("PATH", new_path);
         tracing::info!(
@@ -552,6 +577,12 @@ fn augment_path_for_gui_launch() {
     }
 }
 
+/// The OS's PATH list separator (`:` unix, `;` Windows).
+#[cfg(windows)]
+const PATH_LIST_SEPARATOR: char = ';';
+#[cfg(not(windows))]
+const PATH_LIST_SEPARATOR: char = ':';
+
 /// Pure core of `augment_path_for_gui_launch`, factored out for testing:
 /// returns the new PATH and the dirs added (front-to-back). Prepends each
 /// candidate that `exists` and isn't already present, preserving candidate
@@ -559,20 +590,21 @@ fn augment_path_for_gui_launch() {
 fn compute_path_augmentation(
     existing: &str,
     candidates: &[String],
+    sep: char,
     exists: impl Fn(&str) -> bool,
 ) -> (String, Vec<String>) {
     let mut entries: Vec<String> =
-        existing.split(':').filter(|s| !s.is_empty()).map(str::to_string).collect();
+        existing.split(sep).filter(|s| !s.is_empty()).map(str::to_string).collect();
     let mut added: Vec<String> = Vec::new();
     // Prepend in reverse so the candidate order is preserved at the front.
     for dir in candidates.iter().rev() {
-        if exists(dir) && !entries.iter().any(|e| e == dir) {
+        if !dir.is_empty() && exists(dir) && !entries.iter().any(|e| e == dir) {
             entries.insert(0, dir.clone());
             added.push(dir.clone());
         }
     }
     added.reverse(); // report front-to-back
-    (entries.join(":"), added)
+    (entries.join(&sep.to_string()), added)
 }
 
 pub fn run() {
@@ -597,45 +629,19 @@ pub fn run() {
 
     let app_state = AppState::new();
 
-    // Shortcuts:
-    //   Cmd+Shift+J = toggle Jarvis on/off (listening ↔ idle)
-    //   Cmd+Shift+H = toggle HUD (mutually exclusive with orb)
-    //   Cmd+Shift+C = close everything (orb + HUD hidden); press again → orb returns
-    let jarvis_sc    = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyJ);
-    let hud_sc       = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyH);
-    let close_sc     = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyC);
-    let reset_sc     = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyR);
-    let stop_sc      = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyS);
-    let brighter_sc  = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Equal);
-    let dimmer_sc    = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Minus);
-    // Orb position presets (⇧⌘1-4 = TL TR BR BL — clockwise from top-left)
-    let pos_tl_sc    = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Digit1);
-    let pos_tr_sc    = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Digit2);
-    let pos_br_sc    = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Digit3);
-    let pos_bl_sc    = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Digit4);
-    // DEV: preview every state
-    let preview_sc   = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyP);
-    // Approve a pending computer-control confirmation (deny = ⇧⌘S / HUD / timeout)
-    let confirm_yes_sc = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyY);
-
-    let app_state_for_handler   = app_state.clone();
-    let app_state_for_preview   = app_state.clone();
-    let app_state_for_reset     = app_state.clone();
-    let app_state_for_stop      = app_state.clone();
-    let app_state_for_bright    = app_state.clone();
-    let jarvis_sc_for_handler   = jarvis_sc.clone();
-    let hud_sc_for_handler      = hud_sc.clone();
-    let close_sc_for_handler    = close_sc.clone();
-    let reset_sc_for_handler    = reset_sc.clone();
-    let stop_sc_for_handler     = stop_sc.clone();
-    let brighter_sc_for_handler = brighter_sc.clone();
-    let dimmer_sc_for_handler   = dimmer_sc.clone();
-    let pos_tl_sc_for_handler   = pos_tl_sc.clone();
-    let pos_tr_sc_for_handler   = pos_tr_sc.clone();
-    let pos_br_sc_for_handler   = pos_br_sc.clone();
-    let pos_bl_sc_for_handler   = pos_bl_sc.clone();
-    let preview_sc_for_handler  = preview_sc.clone();
-    let confirm_yes_sc_for_handler = confirm_yes_sc.clone();
+    // Shortcuts (macOS: Cmd+Shift+<key>; Windows/Linux: Ctrl+Alt+<key> —
+    // Ctrl+Shift would globally steal common app shortcuts like Ctrl+Shift+S
+    // "save as" and Ctrl+Shift+J devtools, and Win+Shift collides with OS
+    // shortcuts like Win+Shift+S snipping):
+    //   <mods>+J = toggle Jarvis on/off (listening ↔ idle)
+    //   <mods>+H = toggle HUD (mutually exclusive with orb)
+    //   <mods>+C = close everything (orb + HUD hidden); press again → orb returns
+    //
+    // The HANDLER dispatches on the KEY alone (it only ever fires for
+    // shortcuts this app registered), so registration can transparently fall
+    // back to an alternate modifier combo when another app owns one of ours
+    // (e.g. AMD ReLive holds Ctrl+Alt+R on many Windows machines).
+    let app_state_for_handler = app_state.clone();
 
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init());
@@ -649,48 +655,50 @@ pub fn run() {
                     if event.state() != ShortcutState::Pressed {
                         return;
                     }
-                    if shortcut == &jarvis_sc_for_handler {
-                        tracing::info!("hotkey: Cmd+Shift+J — toggle Jarvis");
-                        app_state_for_handler.toggle(app);
-                    } else if shortcut == &hud_sc_for_handler {
-                        tracing::info!("hotkey: Cmd+Shift+H — toggle HUD");
-                        toggle_hud_internal(app);
-                    } else if shortcut == &close_sc_for_handler {
-                        tracing::info!("hotkey: Cmd+Shift+C — close Jarvis");
-                        toggle_close_internal(app);
-                    } else if shortcut == &reset_sc_for_handler {
-                        tracing::info!("hotkey: Cmd+Shift+R — reset conversation");
-                        app_state_for_reset.reset_context(app);
-                    } else if shortcut == &stop_sc_for_handler {
-                        tracing::info!("hotkey: Cmd+Shift+S — stop");
-                        app_state_for_stop.stop(app);
-                    } else if shortcut == &brighter_sc_for_handler {
-                        app_state_for_bright.adjust_brightness(app, 0.15);
-                    } else if shortcut == &dimmer_sc_for_handler {
-                        app_state_for_bright.adjust_brightness(app, -0.15);
-                    } else if shortcut == &pos_tl_sc_for_handler {
-                        if let Some(orb) = app.get_webview_window("orb") {
-                            let _ = move_orb_to_preset(&orb, OrbPreset::TopLeft);
+                    match shortcut.key {
+                        Code::KeyJ => {
+                            tracing::info!("hotkey: J — toggle Jarvis");
+                            app_state_for_handler.toggle(app);
                         }
-                    } else if shortcut == &pos_tr_sc_for_handler {
-                        if let Some(orb) = app.get_webview_window("orb") {
-                            let _ = move_orb_to_preset(&orb, OrbPreset::TopRight);
+                        Code::KeyH => {
+                            tracing::info!("hotkey: H — toggle HUD");
+                            toggle_hud_internal(app);
                         }
-                    } else if shortcut == &pos_br_sc_for_handler {
-                        if let Some(orb) = app.get_webview_window("orb") {
-                            let _ = move_orb_to_preset(&orb, OrbPreset::BottomRight);
+                        Code::KeyC => {
+                            tracing::info!("hotkey: C — close Jarvis");
+                            toggle_close_internal(app);
                         }
-                    } else if shortcut == &pos_bl_sc_for_handler {
-                        if let Some(orb) = app.get_webview_window("orb") {
-                            let _ = move_orb_to_preset(&orb, OrbPreset::BottomLeft);
+                        Code::KeyR => {
+                            tracing::info!("hotkey: R — reset conversation");
+                            app_state_for_handler.reset_context(app);
                         }
-                    } else if shortcut == &preview_sc_for_handler {
-                        tracing::info!("hotkey: Cmd+Shift+P — preview cycle (dev)");
-                        app_state_for_preview.dev_cycle(app);
-                    } else if shortcut == &confirm_yes_sc_for_handler {
-                        if gate::resolve_latest(true) {
-                            tracing::info!("hotkey: Cmd+Shift+Y — approved pending action");
+                        Code::KeyS => {
+                            tracing::info!("hotkey: S — stop");
+                            app_state_for_handler.stop(app);
                         }
+                        Code::Equal => app_state_for_handler.adjust_brightness(app, 0.15),
+                        Code::Minus => app_state_for_handler.adjust_brightness(app, -0.15),
+                        Code::Digit1 | Code::Digit2 | Code::Digit3 | Code::Digit4 => {
+                            let preset = match shortcut.key {
+                                Code::Digit1 => OrbPreset::TopLeft,
+                                Code::Digit2 => OrbPreset::TopRight,
+                                Code::Digit3 => OrbPreset::BottomRight,
+                                _ => OrbPreset::BottomLeft,
+                            };
+                            if let Some(orb) = app.get_webview_window("orb") {
+                                let _ = move_orb_to_preset(&orb, preset);
+                            }
+                        }
+                        Code::KeyP => {
+                            tracing::info!("hotkey: P — preview cycle (dev)");
+                            app_state_for_handler.dev_cycle(app);
+                        }
+                        Code::KeyY => {
+                            if gate::resolve_latest(true) {
+                                tracing::info!("hotkey: Y — approved pending action");
+                            }
+                        }
+                        _ => {}
                     }
                 })
                 .build(),
@@ -804,8 +812,19 @@ pub fn run() {
                         let profile = data_dir.join("playwright-profile");
                         std::thread::spawn(move || {
                             let profile = profile.to_string_lossy().into_owned();
-                            if let Err(e) = pw_mgr.init_playwright(&profile) {
-                                tracing::warn!("mcp[playwright]: {e}");
+                            // One retry after a pause: the first-ever `npx` run
+                            // may still be downloading the package when the MCP
+                            // handshake times out — the second attempt hits the
+                            // warm cache.
+                            for attempt in 1..=2 {
+                                match pw_mgr.init_playwright(&profile) {
+                                    Ok(()) => break,
+                                    Err(e) if attempt == 1 => {
+                                        tracing::warn!("mcp[playwright]: {e} — retrying in 10s");
+                                        std::thread::sleep(std::time::Duration::from_secs(10));
+                                    }
+                                    Err(e) => tracing::warn!("mcp[playwright]: {e}"),
+                                }
                             }
                         });
                     }
@@ -881,20 +900,49 @@ pub fn run() {
                 Err(e) => tracing::warn!("mcp: failed to start manager: {e}"),
             }
 
+            // Register every hotkey individually and NEVER fail startup over
+            // one: on Windows other software commonly owns combos globally
+            // (AMD ReLive holds Ctrl+Alt+R, OBS defaults, IME switchers …).
+            // If the primary combo is taken, retry with an extra Shift; if
+            // that's taken too, log and move on — the app must still start.
+            #[cfg(target_os = "macos")]
+            let (mods, alt_mods) = (
+                Modifiers::SUPER | Modifiers::SHIFT,
+                Modifiers::SUPER | Modifiers::SHIFT | Modifiers::CONTROL,
+            );
+            #[cfg(not(target_os = "macos"))]
+            let (mods, alt_mods) = (
+                Modifiers::CONTROL | Modifiers::ALT,
+                Modifiers::CONTROL | Modifiers::ALT | Modifiers::SHIFT,
+            );
             let gs = app.global_shortcut();
-            gs.register(jarvis_sc)?;
-            gs.register(hud_sc)?;
-            gs.register(close_sc)?;
-            gs.register(reset_sc)?;
-            gs.register(stop_sc)?;
-            gs.register(brighter_sc)?;
-            gs.register(dimmer_sc)?;
-            gs.register(pos_tl_sc)?;
-            gs.register(pos_tr_sc)?;
-            gs.register(pos_br_sc)?;
-            gs.register(pos_bl_sc)?;
-            gs.register(preview_sc)?;
-            gs.register(confirm_yes_sc)?;
+            for code in [
+                Code::KeyJ,
+                Code::KeyH,
+                Code::KeyC,
+                Code::KeyR,
+                Code::KeyS,
+                Code::Equal,
+                Code::Minus,
+                Code::Digit1,
+                Code::Digit2,
+                Code::Digit3,
+                Code::Digit4,
+                Code::KeyP,
+                Code::KeyY,
+            ] {
+                if gs.register(Shortcut::new(Some(mods), code)).is_ok() {
+                    continue;
+                }
+                match gs.register(Shortcut::new(Some(alt_mods), code)) {
+                    Ok(_) => tracing::warn!(
+                        "hotkey {code:?}: primary combo is taken by another app — registered with Shift added instead"
+                    ),
+                    Err(e) => tracing::warn!(
+                        "hotkey {code:?}: unavailable (both combos taken): {e}"
+                    ),
+                }
+            }
 
             // Persist orb position whenever the user drags or hotkey-moves it.
             if let Some(orb) = app.get_webview_window("orb") {
@@ -964,16 +1012,21 @@ pub fn run() {
                 });
             }
 
+            #[cfg(target_os = "macos")]
+            let mod_label = "Cmd+Shift";
+            #[cfg(not(target_os = "macos"))]
+            let mod_label = "Ctrl+Alt";
             tracing::info!(
                 "Jarvis ready.  Hotkeys: \
-                 Cmd+Shift+J on/off | \
-                 Cmd+Shift+S stop | \
-                 Cmd+Shift+H HUD | \
-                 Cmd+Shift+C close | \
-                 Cmd+Shift+R reset | \
-                 Cmd+Shift+(+/-) brightness | \
-                 Cmd+Shift+(1..4) corner | \
-                 Cmd+Shift+P preview (dev)"
+                 {m}+J on/off | \
+                 {m}+S stop | \
+                 {m}+H HUD | \
+                 {m}+C close | \
+                 {m}+R reset | \
+                 {m}+(+/-) brightness | \
+                 {m}+(1..4) corner | \
+                 {m}+P preview (dev)",
+                m = mod_label
             );
             Ok(())
         })
@@ -1128,7 +1181,7 @@ mod path_tests {
         // prepended in candidate order (so ~/.local/bin wins the `claude` lookup).
         let candidates = cands(&["/u/.local/bin", "/opt/homebrew/bin", "/missing"]);
         let (new_path, added) =
-            compute_path_augmentation("/usr/bin", &candidates, |d| d != "/missing");
+            compute_path_augmentation("/usr/bin", &candidates, ':', |d| d != "/missing");
         assert_eq!(new_path, "/u/.local/bin:/opt/homebrew/bin:/usr/bin");
         assert_eq!(added, vec!["/u/.local/bin", "/opt/homebrew/bin"]);
     }
@@ -1138,7 +1191,7 @@ mod path_tests {
         // The terminal case: the dirs are already on PATH, so nothing changes.
         let candidates = cands(&["/u/.local/bin", "/opt/homebrew/bin"]);
         let existing = "/u/.local/bin:/opt/homebrew/bin:/usr/bin";
-        let (new_path, added) = compute_path_augmentation(existing, &candidates, |_| true);
+        let (new_path, added) = compute_path_augmentation(existing, &candidates, ':', |_| true);
         assert_eq!(new_path, existing);
         assert!(added.is_empty(), "should not re-add present dirs: {added:?}");
     }
@@ -1147,7 +1200,7 @@ mod path_tests {
     fn missing_dirs_are_skipped() {
         // Candidate dirs that don't exist on disk are never added.
         let candidates = cands(&["/nope1", "/nope2"]);
-        let (new_path, added) = compute_path_augmentation("/usr/bin", &candidates, |_| false);
+        let (new_path, added) = compute_path_augmentation("/usr/bin", &candidates, ':', |_| false);
         assert_eq!(new_path, "/usr/bin");
         assert!(added.is_empty());
     }
@@ -1157,8 +1210,21 @@ mod path_tests {
         let candidates = cands(&["/u/.local/bin", "/opt/homebrew/bin"]);
         // /opt/homebrew/bin already present; only ~/.local/bin should prepend.
         let (new_path, added) =
-            compute_path_augmentation("/opt/homebrew/bin:/usr/bin", &candidates, |_| true);
+            compute_path_augmentation("/opt/homebrew/bin:/usr/bin", &candidates, ':', |_| true);
         assert_eq!(new_path, "/u/.local/bin:/opt/homebrew/bin:/usr/bin");
         assert_eq!(added, vec!["/u/.local/bin"]);
+    }
+
+    #[test]
+    fn windows_semicolon_paths_augment_too() {
+        let candidates = cands(&["C:\\u\\.cargo\\bin", "C:\\npm"]);
+        let (new_path, added) = compute_path_augmentation(
+            "C:\\Windows;C:\\Windows\\System32",
+            &candidates,
+            ';',
+            |_| true,
+        );
+        assert_eq!(new_path, "C:\\u\\.cargo\\bin;C:\\npm;C:\\Windows;C:\\Windows\\System32");
+        assert_eq!(added, vec!["C:\\u\\.cargo\\bin", "C:\\npm"]);
     }
 }

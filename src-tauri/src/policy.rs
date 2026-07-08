@@ -142,7 +142,7 @@ impl Default for Policy {
 /// Credential / secret locations the agent must never read or clobber by
 /// default. Home-relative; matched against absolute paths after `~` expansion.
 fn default_denied_paths() -> Vec<String> {
-    [
+    let mut v: Vec<String> = [
         "~/.ssh",
         "~/.aws",
         "~/.gnupg",
@@ -155,13 +155,25 @@ fn default_denied_paths() -> Vec<String> {
     ]
     .into_iter()
     .map(String::from)
-    .collect()
+    .collect();
+    #[cfg(windows)]
+    v.extend(
+        [
+            // Windows credential / secret stores.
+            "~/AppData/Roaming/Microsoft/Credentials",
+            "~/AppData/Local/Microsoft/Credentials",
+            "~/AppData/Roaming/Microsoft/Protect", // DPAPI master keys
+        ]
+        .into_iter()
+        .map(String::from),
+    );
+    v
 }
 
 /// Shell-command fragments that scream "irreversible damage". ADVISORY only —
 /// confirmation is the real gate; this just refuses the obvious foot-guns.
 fn default_denied_commands() -> Vec<String> {
-    [
+    let mut v: Vec<String> = [
         r"rm\s+-[a-z]*r[a-z]*f",   // rm -rf / -fr / -Rf …
         r"rm\s+-[a-z]*f[a-z]*r",
         r"\bmkfs",
@@ -177,7 +189,27 @@ fn default_denied_commands() -> Vec<String> {
     ]
     .into_iter()
     .map(String::from)
-    .collect()
+    .collect();
+    #[cfg(windows)]
+    v.extend(
+        [
+            // Windows foot-guns (run_shell goes through cmd.exe here).
+            r"\bformat\s+[a-z]:",
+            r"\b(del|erase)\s+.*\/[sq]",          // del /s /q …
+            r"\b(rd|rmdir)\s+.*\/s",              // rd /s …
+            r"remove-item\s+.*-recurse",
+            r"\bdiskpart\b",
+            r"\bbcdedit\b",
+            r"\bvssadmin\s+delete",
+            r"\breg\s+delete\b",
+            r"\bcipher\s+/w",
+            r"irm\s+.*\|\s*iex",                  // curl|sh, PowerShell edition
+            r"iwr\s+.*\|\s*iex",
+        ]
+        .into_iter()
+        .map(String::from),
+    );
+    v
 }
 
 /// HARD protected-paths rule (always on, every mode, not config-overridable).
@@ -418,11 +450,10 @@ impl Policy {
             // (2) Resolve `.`/`..` (and symlinks, when the path exists) before
             //     comparing, so `~/.ssh-backup/../ssh/id_rsa` or a symlink can't
             //     slip past and hit a protected location at runtime.
-            let norm = std::fs::canonicalize(&abs_buf)
-                .unwrap_or_else(|_| lexical_normalize(&abs_buf.to_string_lossy()));
+            let norm = canonicalize_for_compare(&abs_buf.to_string_lossy());
             for denied in &self.denied_paths {
                 let d = expand_home(denied);
-                let dn = std::fs::canonicalize(&d).unwrap_or_else(|_| lexical_normalize(&d));
+                let dn = canonicalize_for_compare(&d);
                 // (3) Case-insensitive compare on macOS/Windows default volumes,
                 //     so `~/.SSH/id_rsa` can't dodge a `~/.ssh` rule.
                 if path_starts_with(&norm, &dn) {
@@ -539,16 +570,7 @@ fn clip(s: &str, max: usize) -> String {
 }
 
 fn expand_home(p: &str) -> String {
-    if let Some(rest) = p.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return format!("{home}/{rest}");
-        }
-    } else if p == "~" {
-        if let Ok(home) = std::env::var("HOME") {
-            return home;
-        }
-    }
-    p.to_string()
+    crate::platform::expand_home(p)
 }
 
 /// Component-wise prefix check, case-insensitive on platforms whose default
@@ -561,6 +583,31 @@ fn path_starts_with(path: &std::path::Path, prefix: &std::path::Path) -> bool {
     } else {
         path.starts_with(prefix)
     }
+}
+
+/// Canonicalize when the path exists, else lexically normalize — in BOTH
+/// cases yielding a comparable form. On Windows `fs::canonicalize` returns a
+/// verbatim path (`\\?\C:\...`); the prefix must be stripped or an existing
+/// denied dir would never prefix-match a nonexistent (lexically-normalized)
+/// probe path, silently disabling the deny rule.
+fn canonicalize_for_compare(p: &str) -> std::path::PathBuf {
+    match std::fs::canonicalize(p) {
+        Ok(c) => strip_verbatim(c),
+        Err(_) => lexical_normalize(p),
+    }
+}
+
+/// Strip Windows verbatim prefixes: `\\?\C:\x` → `C:\x`, `\\?\UNC\srv\x` →
+/// `\\srv\x`. Everything else passes through.
+fn strip_verbatim(p: std::path::PathBuf) -> std::path::PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return std::path::PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return std::path::PathBuf::from(rest);
+    }
+    p
 }
 
 /// Resolve `.`/`..` components without touching the filesystem (so it also
@@ -649,10 +696,14 @@ denied_apps = []
 # Paths Jarvis may read/write. Empty = no extra restriction beyond denied_paths.
 allowed_paths = []
 
-# Protected locations (credentials/keys). Denied in safe/trusted, confirmed in dev.
+# Protected locations (credentials/keys). Denied in safe/trusted, confirmed in
+# dev. Entries for the "other" OS simply never match — safe to keep both sets.
 denied_paths = [
   "~/.ssh", "~/.aws", "~/.gnupg", "~/.config/gcloud", "~/.kube",
   "~/.netrc", "~/.npmrc", "~/Library/Keychains",
+  "~/AppData/Roaming/Microsoft/Credentials",
+  "~/AppData/Local/Microsoft/Credentials",
+  "~/AppData/Roaming/Microsoft/Protect",
 ]
 
 # Shell-command patterns (regex, case-insensitive) treated as dangerous.
@@ -660,6 +711,10 @@ denied_paths = [
 denied_command_patterns = [
   "rm\\s+-[a-z]*r[a-z]*f", "\\bmkfs", "\\bdd\\s+.*of=/dev/",
   ":\\(\\)\\s*\\{.*\\};:", "\\bsudo\\b", "curl\\s+.*\\|\\s*(sh|bash|zsh)",
+  "\\bformat\\s+[a-z]:", "\\b(del|erase)\\s+.*\\/[sq]", "\\b(rd|rmdir)\\s+.*\\/s",
+  "remove-item\\s+.*-recurse", "\\bdiskpart\\b", "\\bbcdedit\\b",
+  "\\bvssadmin\\s+delete", "\\breg\\s+delete\\b",
+  "irm\\s+.*\\|\\s*iex", "iwr\\s+.*\\|\\s*iex",
 ]
 
 # Seconds to wait for a confirmation before defaulting to "deny".
@@ -758,7 +813,7 @@ mod tests {
     #[test]
     fn path_traversal_is_blocked() {
         let p = Policy::default(); // safe mode, default denied_paths incl ~/.ssh
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let home = crate::platform::home_dir();
         // `..` traversal that resolves into the protected ~/.ssh must be denied.
         let args = json!({ "path": format!("{home}/.ssh-backup/../.ssh/id_rsa") });
         match p.decide("read_file", DangerLevel::ReadOnly, &args, false) {
@@ -781,7 +836,7 @@ mod tests {
         // a protected dir must still be denied.
         if cfg!(any(target_os = "macos", target_os = "windows")) {
             let p = Policy::default();
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+            let home = crate::platform::home_dir();
             let args = json!({ "path": format!("{home}/.SSH/id_rsa") });
             match p.decide("read_file", DangerLevel::ReadOnly, &args, false) {
                 Decision::Deny { .. } => {}

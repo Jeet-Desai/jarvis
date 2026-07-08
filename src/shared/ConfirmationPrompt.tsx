@@ -1,5 +1,6 @@
 import { Show } from "solid-js";
 import { pendingConfirm, resolveConfirm, type Danger } from "./state";
+import { HK_APPROVE, HK_DENY } from "./hotkeys";
 import "./confirm.css";
 
 const DANGER_LABEL: Record<Danger, string> = {
@@ -51,7 +52,7 @@ export function ConfirmationPrompt(props: Props) {
                 </button>
               </div>
               <div class="jv-confirm-hint">
-                <kbd>⌘⇧Y</kbd> approve · <kbd>⌘⇧S</kbd> deny
+                <kbd>{HK_APPROVE}</kbd> approve · <kbd>{HK_DENY}</kbd> deny
               </div>
             </div>
           </div>
@@ -68,7 +69,7 @@ function OrbConfirm(props: { danger: Danger; summary: string }) {
         <div class="jv-confirm-orb-badge">⚠ {DANGER_LABEL[props.danger]} · APPROVAL NEEDED</div>
         <div class="jv-confirm-orb-summary">{props.summary}</div>
         <div class="jv-confirm-orb-hint">
-          <kbd>⌘⇧Y</kbd> approve · <kbd>⌘⇧S</kbd> deny
+          <kbd>{HK_APPROVE}</kbd> approve · <kbd>{HK_DENY}</kbd> deny
         </div>
       </div>
     </div>

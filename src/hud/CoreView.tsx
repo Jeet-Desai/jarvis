@@ -11,6 +11,7 @@ import {
 import { agentMeta, isActive } from "../shared/agentMeta";
 import { ActivityFeed } from "../shared/ActivityFeed";
 import { Reactor } from "../shared/ReactorCanvas";
+import { HK_TOGGLE } from "../shared/hotkeys";
 
 const STATES: { key: JarvisState; label: string }[] = [
   { key: "idle", label: "IDLE" },
@@ -120,7 +121,7 @@ export function CoreView(props: { onOpenAgent: (id: string | null) => void }) {
         <div class="core-card">
           <div class="core-card-label">YOU</div>
           <div class="core-card-text" title={transcript()}>
-            {transcript() || <span class="core-placeholder">— press ⌘⇧J and speak —</span>}
+            {transcript() || <span class="core-placeholder">— press {HK_TOGGLE} and speak —</span>}
           </div>
         </div>
         <div class="core-card">

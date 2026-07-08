@@ -19,7 +19,7 @@ use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use crate::tools;
-use super::{LlmProvider, Message, Role, MAX_TOOL_ROUNDS, REQUEST_TIMEOUT_SECS, SYSTEM_PROMPT};
+use super::{system_prompt, LlmProvider, Message, Role, MAX_TOOL_ROUNDS, REQUEST_TIMEOUT_SECS};
 
 const DEFAULT_BASE_URL: &str = "http://localhost:11434";
 const DEFAULT_MODEL:    &str = "qwen2.5:7b";
@@ -62,7 +62,7 @@ impl LlmProvider for Provider {
         // OpenAI-compatible messages format
         let mut messages: Vec<Value> = vec![json!({
             "role": "system",
-            "content": SYSTEM_PROMPT,
+            "content": system_prompt(),
         })];
         for m in history {
             let role = match m.role { Role::User => "user", Role::Assistant => "assistant" };

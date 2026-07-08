@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::tools;
-use super::{LlmProvider, Message, Role, MAX_TOOL_ROUNDS, REQUEST_TIMEOUT_SECS, SYSTEM_PROMPT};
+use super::{system_prompt, LlmProvider, Message, Role, MAX_TOOL_ROUNDS, REQUEST_TIMEOUT_SECS};
 
 const DEFAULT_MODEL: &str = "gemini-2.5-flash-lite";
 const ENDPOINT_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/models";
@@ -51,7 +51,7 @@ impl LlmProvider for Provider {
 
         for round in 0..MAX_TOOL_ROUNDS {
             let body = json!({
-                "systemInstruction": { "parts": [{ "text": SYSTEM_PROMPT }] },
+                "systemInstruction": { "parts": [{ "text": system_prompt() }] },
                 "contents": contents,
                 "tools": [{ "functionDeclarations": tool_decls }],
                 "generationConfig": {

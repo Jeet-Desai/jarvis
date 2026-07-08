@@ -1,0 +1,40 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "windows": [
+      {
+        "label": "orb",
+        "url": "/",
+        "title": "Jarvis",
+        "width": 360,
+        "height": 512,
+        "minWidth": 360,
+        "minHeight": 512,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": false,
+        "shadow": false,
+        "visible": true,
+        "focus": true
+      },
+      {
+        "label": "hud",
+        "url": "/hud",
+        "title": "Jarvis HUD",
+        "width": 1440,
+        "height": 900,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": false,
+        "shadow": false,
+        "visible": false,
+        "focus": false,
+        "fullscreen": false
+      }
+    ]
+  }
+}

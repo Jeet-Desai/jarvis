@@ -23,7 +23,7 @@ No linter is configured. The only tests are the pure-logic unit tests in `policy
 
 The frontend `pnpm dev` is automatically invoked by `tauri dev` via `beforeDevCommand` in `tauri.conf.json` on port 1420 — do not start Vite separately.
 
-macOS only. The build assumes Apple Silicon + Metal; `whisper-rs` is compiled with the `metal` feature flag in `src-tauri/Cargo.toml`.
+Cross-platform: macOS (primary) + Windows. On macOS `whisper-rs` compiles with the `metal` feature (Apple Silicon); on Windows it's the CPU backend and the default STT model is `base.en` (wake-word loop stays responsive). Windows builds need VS Build Tools (C++), CMake, and LLVM (libclang for whisper-rs bindgen; set `LIBCLANG_PATH` if not auto-found). Platform seams: `src-tauri/src/platform.rs` (home dir, kill, console-window suppression), `control/windows.rs` (UI Automation reader + Win32 app management + UIA browser context — the Windows counterpart of both `control/macos.rs` AND the AppleScript helpers in `tools.rs`), cfg-split handlers in `tools.rs`/`tts.rs`/`brain/vision.rs`. Hotkeys are Cmd+Shift on macOS, Ctrl+Alt on Windows. The system prompt is platform-adjusted at runtime via `brain::system_prompt()` — new prompt text goes into `SYSTEM_PROMPT` and, if OS-specific, into that function's Windows rewrite list.
 
 ## Architecture
 

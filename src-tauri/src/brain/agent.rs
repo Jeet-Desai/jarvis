@@ -89,7 +89,7 @@ impl LlmProvider for Provider {
             .ok_or_else(|| anyhow!("Jarvis MCP server not running — brain temporarily unavailable"))?;
 
         let prompt = build_prompt(history);
-        let system = format!("{}{}", super::SYSTEM_PROMPT, AGENT_SYSTEM_SUFFIX);
+        let system = format!("{}{}", super::system_prompt(), AGENT_SYSTEM_SUFFIX);
         self.driver.run(&prompt, &system, &endpoint)
     }
 }
@@ -176,7 +176,7 @@ impl Driver for ClaudeCodeDriver {
         })
         .to_string();
 
-        let mut cmd = std::process::Command::new("claude");
+        let mut cmd = claude_command();
         cmd.arg("-p")
             .arg(prompt)
             .arg("--system-prompt")
@@ -255,6 +255,36 @@ impl Driver for ClaudeCodeDriver {
     }
 }
 
+/// Build the base `claude` invocation. On Windows an npm-installed `claude`
+/// is a `.cmd` batch wrapper that CreateProcess can't run directly — if only
+/// the `.cmd`/`.bat` form exists on PATH, route through `cmd /C` (console
+/// window suppressed). A native `claude.exe` (or unix binary) spawns directly.
+fn claude_command() -> std::process::Command {
+    #[cfg(windows)]
+    {
+        let direct = std::env::var("PATH")
+            .ok()
+            .map(|p| {
+                std::env::split_paths(&p)
+                    .any(|dir| dir.join("claude.exe").is_file() || dir.join("claude").is_file())
+            })
+            .unwrap_or(false);
+        let mut cmd = if direct {
+            std::process::Command::new("claude")
+        } else {
+            let mut c = std::process::Command::new("cmd");
+            c.arg("/C").arg("claude");
+            c
+        };
+        crate::platform::hide_console(&mut cmd);
+        cmd
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("claude")
+    }
+}
+
 /// Pull the final assistant text out of `claude -p --output-format json`.
 /// Shape: `{ "type":"result", "subtype":"success", "is_error":false,
 /// "result":"<final text>", ... }`. Returns None on error/empty.
@@ -279,18 +309,27 @@ fn env_flag(key: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Is `name` executable from PATH? On Windows also checks the PATHEXT-style
+/// variants (`.exe`, `.cmd`, `.bat`) that npm-installed CLIs use.
 fn binary_on_path(name: &str) -> bool {
     let Ok(path) = std::env::var("PATH") else {
         return false;
     };
-    std::env::split_paths(&path).any(|dir| dir.join(name).is_file())
+    std::env::split_paths(&path).any(|dir| {
+        if dir.join(name).is_file() {
+            return true;
+        }
+        if cfg!(windows) {
+            for ext in ["exe", "cmd", "bat"] {
+                if dir.join(format!("{name}.{ext}")).is_file() {
+                    return true;
+                }
+            }
+        }
+        false
+    })
 }
 
-#[cfg(unix)]
 fn kill_pid(pid: u32) {
-    unsafe {
-        libc::kill(pid as i32, libc::SIGKILL);
-    }
+    crate::platform::kill_pid(pid);
 }
-#[cfg(not(unix))]
-fn kill_pid(_pid: u32) {}

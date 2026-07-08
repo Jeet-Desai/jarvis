@@ -1,4 +1,5 @@
-//! Text-to-speech: Kokoro neural voice (default) with macOS `say` fallback.
+//! Text-to-speech: Kokoro neural voice (default) with an OS fallback voice
+//! (`say` on macOS, SAPI via PowerShell on Windows).
 //!
 //! Returns a `SpeechHandle` that lets the caller wait for OR kill speech — the
 //! kill path is what makes barge-in work.
@@ -28,7 +29,9 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
 const DEFAULT_VOICE:    &str = "Daniel";
+#[cfg(target_os = "macos")]
 const DEFAULT_RATE_WPM: u32  = 195;
 
 /// Replies at or below this length are spoken as ONE clip — no inter-chunk
@@ -152,13 +155,15 @@ impl SpeechHandle {
     }
 
     /// Cut speech short. Safe from any thread, even while `wait_blocking` is
-    /// parked: SIGKILL stops the playing child within milliseconds and the
-    /// cancel flag stops any further chunks/synthesis.
+    /// parked: the hard kill stops the playing child within milliseconds and
+    /// the cancel flag stops any further chunks/synthesis. (The Windows rodio
+    /// path has no child process — its playback loop polls `cancel` every
+    /// ~20ms and stops the sink.)
     pub fn kill(&self) {
         self.inner.cancel.store(true, Ordering::Relaxed);
         if let Some(pid) = *self.inner.current_pid.lock() {
-            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-            tracing::info!("tts: SIGKILL → pid {}", pid);
+            crate::platform::kill_pid(pid);
+            tracing::info!("tts: killed player pid {}", pid);
         }
     }
 }
@@ -252,9 +257,16 @@ fn speak_kokoro_streaming(text: &str) -> Option<SpeechHandle> {
             }
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok((path, envelope)) => {
-                    let mut cmd = Command::new("afplay");
-                    cmd.arg(&path);
-                    inner_co.play(cmd, CLIP_CEILING_SECS, Some(&envelope));
+                    #[cfg(target_os = "macos")]
+                    {
+                        let mut cmd = Command::new("afplay");
+                        cmd.arg(&path);
+                        inner_co.play(cmd, CLIP_CEILING_SECS, Some(&envelope));
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        inner_co.play_wav_native(&path, CLIP_CEILING_SECS, Some(&envelope));
+                    }
                 }
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -267,7 +279,113 @@ fn speak_kokoro_streaming(text: &str) -> Option<SpeechHandle> {
     Some(SpeechHandle::spawn(inner, join))
 }
 
+/// Play a synthesized WAV via rodio (WASAPI on Windows) — the `afplay`
+/// replacement. Polls the cancel flag every ~20ms (so barge-in stays snappy)
+/// and replays the loudness envelope in step with the playback clock, exactly
+/// like the child-process path.
+#[cfg(not(target_os = "macos"))]
+impl SpeechInner {
+    fn play_wav_native(&self, path: &PathBuf, ceiling_secs: u64, envelope: Option<&[f32]>) {
+        if self.cancelled() {
+            return;
+        }
+        let samples = match read_wav_f32(path) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("tts: wav read failed: {e}");
+                return;
+            }
+        };
+        let (channels, rate, data) = samples;
+        let Ok((_stream, handle)) = rodio::OutputStream::try_default() else {
+            tracing::warn!("tts: no audio output device");
+            return;
+        };
+        let Ok(sink) = rodio::Sink::try_new(&handle) else {
+            tracing::warn!("tts: couldn't open audio sink");
+            return;
+        };
+        sink.append(rodio::buffer::SamplesBuffer::new(channels, rate, data));
+
+        let start = Instant::now();
+        let max = Duration::from_secs(ceiling_secs.max(1));
+        let mut env_idx = usize::MAX;
+        loop {
+            if let Some(env) = envelope {
+                let idx = (start.elapsed().as_millis() as u64 / crate::kokoro::ENV_DT_MS) as usize;
+                if idx != env_idx && idx < env.len() {
+                    env_idx = idx;
+                    emit_level(env[idx]);
+                }
+            }
+            if self.cancelled() {
+                sink.stop();
+                break;
+            }
+            if sink.empty() {
+                break;
+            }
+            if start.elapsed() > max {
+                tracing::warn!("tts: clip exceeded {ceiling_secs}s — stopping");
+                sink.stop();
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        if envelope.is_some() {
+            emit_level(0.0);
+        }
+    }
+}
+
+/// Read a WAV file into interleaved f32 samples (any of the formats Kokoro /
+/// hound write). Returns (channels, sample_rate, samples).
+#[cfg(not(target_os = "macos"))]
+fn read_wav_f32(path: &PathBuf) -> Result<(u16, u32, Vec<f32>)> {
+    let mut reader = hound::WavReader::open(path)?;
+    let spec = reader.spec();
+    let data: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => reader.samples::<f32>().filter_map(Result::ok).collect(),
+        hound::SampleFormat::Int => {
+            let scale = 1.0 / (1i64 << (spec.bits_per_sample - 1)) as f32;
+            reader
+                .samples::<i32>()
+                .filter_map(Result::ok)
+                .map(|s| s as f32 * scale)
+                .collect()
+        }
+    };
+    Ok((spec.channels, spec.sample_rate, data))
+}
+
+/// The OS fallback voice, single clip. macOS: `say` (streams its own audio).
+/// Windows: SAPI via a hidden PowerShell (System.Speech) — only used when the
+/// Kokoro models aren't downloaded, so quality here is a floor, not the norm.
+#[cfg(not(target_os = "macos"))]
+fn speak_say(text: &str) -> SpeechHandle {
+    let ceiling = ((text.chars().count() as u64) / 8 + 8).min(180);
+    tracing::info!("tts: speaking (sapi fallback) — {:?}", truncate(text, 80));
+
+    // Single-quoted PowerShell literal: escaping is just ' → ''.
+    let escaped = text.replace('\'', "''");
+    let script = format!(
+        "Add-Type -AssemblyName System.Speech; \
+         $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; \
+         $s.Rate = 1; \
+         $s.Speak('{escaped}');"
+    );
+    let mut cmd = Command::new("powershell");
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    crate::platform::hide_console(&mut cmd);
+
+    let inner = Arc::new(SpeechInner::new());
+    let inner_co = inner.clone();
+    let join = thread::spawn(move || inner_co.play(cmd, ceiling, None));
+    SpeechHandle::spawn(inner, join)
+}
+
 /// macOS `say` — the fallback voice. Single chunk (say streams its own audio).
+#[cfg(target_os = "macos")]
 fn speak_say(text: &str) -> SpeechHandle {
     let voice = std::env::var("JARVIS_VOICE").unwrap_or_else(|_| DEFAULT_VOICE.into());
     let rate: u32 = std::env::var("JARVIS_VOICE_RATE")

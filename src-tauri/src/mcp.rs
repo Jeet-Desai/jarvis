@@ -25,6 +25,98 @@ use std::sync::{Arc, OnceLock};
 use tokio::process::Command as TokioCommand;
 use tokio::runtime::Runtime;
 
+/// Build the command that runs `npx`. On Windows `npx` is a `.cmd` batch
+/// wrapper which CreateProcess can't spawn directly — go through `cmd /C`
+/// (with the console window suppressed). Unix spawns it directly.
+fn npx_command() -> TokioCommand {
+    #[cfg(windows)]
+    {
+        // `npx` on Windows is a `.cmd` batch wrapper that CreateProcess can't
+        // spawn directly, and the `cmd /C npx …` chain proved unreliable with
+        // piped MCP stdio. Bypass both: run npm's own `npx-cli.js` under
+        // node.exe directly — a single real process with clean stdin/stdout.
+        // Fall back to `cmd /C npx` if the script can't be located.
+        let mut c = match find_npx_cli() {
+            Some((node, cli)) => {
+                let mut c = TokioCommand::new(node);
+                c.arg(cli);
+                c
+            }
+            None => {
+                let mut c = TokioCommand::new("cmd");
+                c.arg("/C").arg("npx");
+                c
+            }
+        };
+        // Under `pnpm tauri dev` the process env carries pnpm's npm_config_*
+        // variables (e.g. verify-deps-before-run), which npm warns about and
+        // can choke on. Scrub them so npx runs with a clean npm config.
+        for (k, _) in std::env::vars() {
+            let lk = k.to_ascii_lowercase();
+            if lk.starts_with("npm_config_")
+                || lk.starts_with("npm_lifecycle_")
+                || lk.starts_with("npm_package_")
+                || lk.starts_with("pnpm_")
+            {
+                c.env_remove(&k);
+            }
+        }
+        // Neutral cwd: from inside the Jarvis repo (a pnpm workspace), npx
+        // mis-resolves the package bin ("'playwright-mcp' is not recognized")
+        // because of the project .npmrc + pnpm node_modules layout. From a
+        // neutral directory it runs from its own cache correctly.
+        c.current_dir(std::env::temp_dir());
+        crate::platform::hide_console_tokio(&mut c);
+        c
+    }
+    #[cfg(not(windows))]
+    {
+        TokioCommand::new("npx")
+    }
+}
+
+/// Build the command that runs the Playwright MCP server. The package is
+/// pinned as a repo devDependency, so we can run its `cli.js` under node
+/// DIRECTLY — no npx at runtime. This matters on Windows, where npx's
+/// batch-shim bin resolution breaks under the pnpm/tauri dev environment
+/// ("'playwright-mcp' is not recognized"); a plain `node cli.js` process has
+/// none of that machinery. Falls back to `npx -y @playwright/mcp@latest`
+/// when the local install isn't there (e.g. running outside the repo).
+fn playwright_command() -> TokioCommand {
+    let local_cli = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(|p| p.join("node_modules").join("@playwright").join("mcp").join("cli.js"));
+    if let Some(cli) = local_cli.filter(|p| p.is_file()) {
+        let mut c = TokioCommand::new("node");
+        c.arg(cli);
+        crate::platform::hide_console_tokio(&mut c);
+        return c;
+    }
+    let mut c = npx_command();
+    c.arg("-y").arg("@playwright/mcp@latest");
+    c
+}
+
+/// Locate node.exe and npm's npx-cli.js next to it (or via npm's prefix
+/// layout). Returns (node path, npx-cli.js path).
+#[cfg(windows)]
+fn find_npx_cli() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let path = std::env::var("PATH").ok()?;
+    for dir in std::env::split_paths(&path) {
+        let node = dir.join("node.exe");
+        if !node.is_file() {
+            continue;
+        }
+        // Standard Node-for-Windows install: npx-cli.js lives inside the
+        // bundled npm package right next to node.exe.
+        let cli = dir.join("node_modules").join("npm").join("bin").join("npx-cli.js");
+        if cli.is_file() {
+            return Some((node, cli));
+        }
+    }
+    None
+}
+
 pub struct McpManager {
     runtime: Runtime,
     /// Long-lived RunningService for the calendar MCP subprocess. We keep the
@@ -79,7 +171,7 @@ impl McpManager {
 
         let service = self.runtime.block_on(async move {
             let transport =
-                TokioChildProcess::new(TokioCommand::new("npx").configure(|c| {
+                TokioChildProcess::new(npx_command().configure(|c| {
                     c.arg("-y")
                         .arg("@cocal/google-calendar-mcp")
                         .env("GOOGLE_OAUTH_CREDENTIALS", &creds);
@@ -144,6 +236,9 @@ impl McpManager {
     /// inherits Jarvis's environment (so the agent SDK sees ANTHROPIC_API_KEY).
     pub fn init_orchestrator(&self, dir: &str) -> Result<()> {
         let dir = std::path::Path::new(dir);
+        #[cfg(windows)]
+        let python = dir.join(".venv").join("Scripts").join("python.exe");
+        #[cfg(not(windows))]
         let python = dir.join(".venv/bin/python");
         let server = dir.join("server.py");
         if !python.exists() {
@@ -162,6 +257,7 @@ impl McpManager {
             let transport =
                 TokioChildProcess::new(TokioCommand::new(&python).configure(|c| {
                     c.arg("server.py").current_dir(&cwd);
+                    crate::platform::hide_console_tokio(c);
                 }))?;
             let service = ().serve(transport).await?;
             match service.peer().list_all_tools().await {
@@ -260,10 +356,8 @@ impl McpManager {
             .unwrap_or_else(|| format!("{profile}-output"));
         let service = self.runtime.block_on(async move {
             let transport =
-                TokioChildProcess::new(TokioCommand::new("npx").configure(|c| {
-                    c.arg("-y")
-                        .arg("@playwright/mcp@latest")
-                        .arg("--output-dir")
+                TokioChildProcess::new(playwright_command().configure(|c| {
+                    c.arg("--output-dir")
                         .arg(&output_dir);
                     if extension_mode {
                         // Connect to the user's real browser tabs. The token (if

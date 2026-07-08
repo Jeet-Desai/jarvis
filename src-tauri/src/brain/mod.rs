@@ -123,6 +123,51 @@ Rule 11 — For irreversible actions (deleting files, sending a message, submitt
 
 Rule 12 — PROTECTED PATHS (hard rule): this assistant is for the user's PERSONAL work only. NEVER read, write, run commands against, open, or build in the user's protected files — specifically any path matching the configured protected markers. The safety gate will refuse these regardless, so don't attempt them; if the user asks for that, tell them briefly to use a separate Claude Code session.";
 
+/// The platform-adjusted system prompt. The canonical text above is written
+/// for macOS (the original platform); on Windows we rewrite the OS-specific
+/// vocabulary (Mac → PC, Cmd → Ctrl, AppleScript-era hints) and append a
+/// short platform briefing so the model acts with the right conventions.
+/// Built once and cached.
+pub fn system_prompt() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        SYSTEM_PROMPT
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        static CACHED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        CACHED.get_or_init(|| {
+            let mut p = SYSTEM_PROMPT
+                .replace("this Mac", "this PC")
+                .replace("on every Mac", "on every PC")
+                .replace("works on every Mac without permission", "works without any permission")
+                .replace("native macOS apps", "native Windows apps")
+                .replace("native macOS UI", "native Windows UI")
+                .replace("NATIVE macOS app", "NATIVE Windows app")
+                .replace("NATIVE macOS apps", "NATIVE Windows apps")
+                .replace("macOS", "Windows")
+                .replace("Cmd-A then Cmd-C", "Ctrl-A then Ctrl-C")
+                .replace("⌘L / Cmd-L", "Ctrl-L")
+                .replace("(Finder, Notes, Slack, the menu bar)", "(File Explorer, Notepad, Slack, system tray apps)")
+                .replace("(Finder, Notes, Slack, Mail, System Settings, the menu bar", "(File Explorer, Notepad, Slack, Outlook, Windows Settings");
+            p.push_str(
+                "\n\n# Platform: Windows\n\
+                 You are operating a Windows PC. Keyboard conventions: the primary modifier is Ctrl \
+                 (Ctrl+C copy, Ctrl+V paste, Ctrl+F find, Ctrl+N new, Ctrl+T new tab); pass 'ctrl' \
+                 (not 'cmd') in send_shortcut modifiers. Alt+F4 closes an app window; the Windows key \
+                 opens the Start menu (modifier name 'win'). App names: File Explorer (not Finder), \
+                 Notepad, Windows Terminal / PowerShell (shell commands run via cmd.exe — use Windows \
+                 command syntax like `dir`, `type`, `del`, or invoke `powershell -Command ...` for \
+                 richer scripting; there is NO osascript/AppleScript). Paths use backslashes and drive \
+                 letters (C:\\Users\\...); `~/` still expands to the user's home folder in the file tools. \
+                 Element roles from read_screen_elements look like 'Button', 'Edit', 'Hyperlink', \
+                 'MenuItem' (no 'AX' prefix).",
+            );
+            p
+        })
+    }
+}
+
 /// Maximum turns of history to keep across providers.
 pub const MAX_HISTORY_TURNS: usize = 12;
 /// Autonomous multi-step web/UI tasks interleave act + observe (focus → read →

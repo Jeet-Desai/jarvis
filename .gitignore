@@ -20,6 +20,9 @@ models/
 /tmp/jarvis_*.wav
 /tmp/jarvis_screen_*.jpg
 
+# Dev-run log written by the Windows launch wrapper
+dev-run.log
+
 # macOS
 .DS_Store
 .AppleDouble

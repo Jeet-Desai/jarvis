@@ -19,7 +19,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::tools;
-use super::{LlmProvider, Message, Role, MAX_TOOL_ROUNDS, REQUEST_TIMEOUT_SECS, SYSTEM_PROMPT};
+use super::{system_prompt, LlmProvider, Message, Role, MAX_TOOL_ROUNDS, REQUEST_TIMEOUT_SECS};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_MODEL:    &str = "gpt-4o-mini";
@@ -56,7 +56,7 @@ impl LlmProvider for Provider {
         // Build messages array — start with system prompt, then history
         let mut messages: Vec<Value> = vec![json!({
             "role": "system",
-            "content": SYSTEM_PROMPT,
+            "content": system_prompt(),
         })];
         for m in history {
             let role = match m.role { Role::User => "user", Role::Assistant => "assistant" };
