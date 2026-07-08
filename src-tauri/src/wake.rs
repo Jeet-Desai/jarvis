@@ -106,33 +106,110 @@ pub fn start_watcher(app: AppHandle, app_state: Arc<AppState>) {
         .expect("wake watcher spawn");
 }
 
-/// Word-boundary match for "jarvis" plus common Whisper mishearings.
-/// Whisper occasionally drops or alters the name when only the single word
-/// "Jarvis" is uttered (no "hey" prefix to anchor context). Accepting a few
-/// near-matches makes the wake word feel more reliable in practice without
-/// causing false positives in normal speech.
+/// Word-boundary match for "jarvis" plus Whisper mishearings.
+///
+/// Whisper (especially the CPU `base.en` build on accented speech) mangles
+/// the bare name in creative ways — observed in the wild: "Jardvis",
+/// "Jardivis", "Jarvise", "Jervis". A hardcoded variant list can't keep up,
+/// so we FUZZY-match: any word that starts with j/y/g, is 5–9 letters, and
+/// is within edit distance 2 of "jarvis" counts. The first-letter + length
+/// guards keep everyday words (davis, juries, jarred, genius…) at distance
+/// ≥3 or filtered, so false positives stay rare. Adjacent word pairs are
+/// also joined ("jar vis" → "jarvis") since Whisper sometimes splits it.
 fn contains_wake_phrase(transcript: &str) -> bool {
     let cleaned: String = transcript
         .chars()
         .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
         .collect();
     let lower = cleaned.to_lowercase();
-    lower.split_whitespace().any(|w| {
-        matches!(w,
-              "jarvis"
-            | "jarvise"
-            | "jarviz"
-            | "jarvice"
-            | "jarves"
-            | "jarvas"
-            | "javis"
-            | "javris"
-            | "jervis"
-            | "jervice"
-            | "yarvis"
-            | "garvis"
-        )
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    if words.iter().any(|w| is_wakeish(w)) {
+        return true;
+    }
+    // Split-word rescue: "jar vis", "jarvi s". Joined pairs get a TIGHTER
+    // cap (distance ≤1): a real split reassembles to distance 0, while
+    // accidental joins of common words ("jury is" → "juryis") land at 2.
+    words.windows(2).any(|pair| {
+        let joined = format!("{}{}", pair[0], pair[1]);
+        let n = joined.chars().count();
+        (5..=8).contains(&n)
+            && matches!(joined.chars().next(), Some('j') | Some('y') | Some('g'))
+            && levenshtein_capped(&joined, "jarvis", 1) <= 1
     })
+}
+
+/// Is this (lowercase) word plausibly "jarvis" as misheard by Whisper?
+fn is_wakeish(w: &str) -> bool {
+    let n = w.chars().count();
+    if !(5..=9).contains(&n) {
+        return false;
+    }
+    if !matches!(w.chars().next(), Some('j') | Some('y') | Some('g')) {
+        return false;
+    }
+    levenshtein_capped(w, "jarvis", 2) <= 2
+}
+
+/// Levenshtein distance, early-exiting once it must exceed `cap` (keeps the
+/// per-word cost trivial for the 600ms wake loop).
+fn levenshtein_capped(a: &str, b: &str, cap: usize) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.len().abs_diff(b.len()) > cap {
+        return cap + 1;
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        let mut row_min = cur[0];
+        for j in 1..=b.len() {
+            let sub = prev[j - 1] + usize::from(a[i - 1] != b[j - 1]);
+            cur[j] = sub.min(prev[j] + 1).min(cur[j - 1] + 1);
+            row_min = row_min.min(cur[j]);
+        }
+        if row_min > cap {
+            return cap + 1; // whole row already over the cap — can't recover
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contains_wake_phrase;
+
+    #[test]
+    fn exact_and_listed_variants_wake() {
+        for t in ["Jarvis", "jarvis,", "Hey Jarvis!", "JARVIS.", "Jervis", "yarvis"] {
+            assert!(contains_wake_phrase(t), "should wake on {t:?}");
+        }
+    }
+
+    #[test]
+    fn observed_cpu_mishearings_wake() {
+        // Real transcripts from the Windows base.en run.
+        for t in ["Jardvis,", "Jardivis", "Jarvise.", "jarviz", "Jarves"] {
+            assert!(contains_wake_phrase(t), "should wake on {t:?}");
+        }
+    }
+
+    #[test]
+    fn split_word_wakes() {
+        assert!(contains_wake_phrase("jar vis"));
+    }
+
+    #[test]
+    fn everyday_speech_does_not_wake() {
+        for t in [
+            "Service,", "and", "How are you?", "Audio, Woody.", "[BLANK_AUDIO]",
+            "Davis is here", "the jury is out", "he jarred the door", "pure genius",
+            "Jada", "javelin throw", "jealous much", "just visiting",
+        ] {
+            assert!(!contains_wake_phrase(t), "false wake on {t:?}");
+        }
+    }
 }
 
 fn rms(samples: &[f32]) -> f32 {
