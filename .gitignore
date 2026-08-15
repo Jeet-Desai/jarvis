@@ -6,6 +6,10 @@ dist
 .env.local
 .env.*.local
 
+# Repo-scoped gh CLI auth — a fine-grained personal-access token with zero
+# access outside this repo. Isolated from ~/.config/gh (the global one).
+.gh/
+
 # Tauri build artifacts
 src-tauri/target
 src-tauri/gen
@@ -49,4 +53,9 @@ orchestrator/stage2-run.out
 # Playwright MCP browser-control session output (snapshot/console/network dumps
 # written to .playwright-mcp/ in the cwd) — regenerated each run, never tracked.
 .playwright-mcp/
+
+# Local Claude Code config — the PreToolUse credential/egress guard. Personal
+# to this machine (absolute paths), so kept out of the repo.
+.claude/settings.local.json
+.claude/hooks/
 
