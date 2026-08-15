@@ -59,22 +59,9 @@ impl Engine {
         // 0. rescue words the G2P would letter-spell (OOV compounds + jargon)
         let text = respell_oov(text, &self.words, &self.respell);
 
-        // 1. text → IPA phoneme string (reference G2P). The lexicon's only
-        // entry for "live" is the verb /lɪv/, so where context says adjective
-        // ("the demo is live", "live output") we g2p around the word and
-        // splice the correct phonemes — IPA can't ride inside the text (the
-        // G2P would treat it as one more unknown word).
-        let mut phonemes = String::new();
-        for (i, seg) in split_adjective_live(&text).iter().enumerate() {
-            if i > 0 {
-                phonemes.push_str(" lˈa‍ɪv ");
-            }
-            if seg.trim().is_empty() {
-                continue;
-            }
-            let (p, _toks) = self.g2p.g2p(seg).map_err(|e| anyhow!("g2p: {e}"))?;
-            phonemes.push_str(&p);
-        }
+        // 1. text → IPA phoneme string, WITH punctuation preserved (see
+        // `phonemize` — misaki-rs deletes every mark, which flattens prosody).
+        let phonemes = self.phonemize(&text)?;
 
         // Surface silent drops: '❓' is misaki's unknown marker, and any char
         // missing from KOKORO_VOCAB is skipped below — both mean audible gaps.
@@ -111,6 +98,164 @@ impl Engine {
         let (_shape, audio) = outputs["audio"].try_extract_tensor::<f32>()?;
         Ok(audio.to_vec())
     }
+
+    /// text → IPA phoneme string **with punctuation preserved**.
+    ///
+    /// This is the difference between a voice that phrases and one that
+    /// drones. `misaki-rs` (any feature set) replaces EVERY punctuation mark
+    /// with a plain space before we ever see it:
+    ///
+    /// ```text
+    /// misaki-rs/src/g2p.rs:262
+    ///   if c.is_ascii_punctuation() || "—–…".contains(c) {
+    ///       tokens[i].phonemes = Some(" ".to_string());
+    ///   }
+    /// ```
+    ///
+    /// So `"Hello, world. Right?"` reached Kokoro as `"həlˈoʊ  wˈɜːld  ɹˈaɪt "`
+    /// — no comma, no full stop, no question mark, even though KOKORO_VOCAB has
+    /// token ids for all of them (`,`=3 `.`=4 `!`=5 `?`=6 `;`=1 `:`=2 `—`=9
+    /// `…`=10). Punctuation is what drives sentence-final falling intonation,
+    /// question rise, and clause grouping, so without it the model has no
+    /// phrase structure at all: it never pauses where a sentence ends, and the
+    /// only pauses left are whatever it invents from runs of spaces.
+    ///
+    /// Fix: segment the TEXT at each mark, phonemise the runs between marks
+    /// separately, and splice the literal mark back into the PHONEME string.
+    /// (The mark can't ride along in the g2p input — that's what gets deleted;
+    /// same reason `split_adjective_live` splices its IPA rather than inlining
+    /// it.)
+    fn phonemize(&self, text: &str) -> Result<String> {
+        phonemize_with(&self.g2p, text)
+    }
+}
+
+/// Free-function core of [`Engine::phonemize`], so it can be exercised without
+/// building an ONNX session (see the tests).
+fn phonemize_with(g2p: &misaki_rs::G2P, text: &str) -> Result<String> {
+    let mut pieces = segment_prosody(text);
+    // Guarantee utterance-final prosody: a reply the model ended without a
+    // full stop ("Done", "Right away sir") otherwise gets no falling
+    // intonation and just stops dead. Chunks are already cut at sentence
+    // boundaries, so a terminal mark here is never mid-sentence.
+    if matches!(pieces.last(), Some(Piece::Text(_))) {
+        pieces.push(Piece::Mark('.'));
+    }
+
+    let mut out = String::new();
+    for piece in pieces {
+        match piece {
+            Piece::Mark(c) => {
+                // Attach the mark directly to the preceding phonemes
+                // (", " not " , ") — that's the reference formatting.
+                while out.ends_with(' ') {
+                    out.pop();
+                }
+                if !out.is_empty() {
+                    out.push(c);
+                    out.push(' ');
+                }
+            }
+            Piece::Text(t) => {
+                // The lexicon's only entry for "live" is the verb /lɪv/, so
+                // where context says adjective ("the demo is live", "live
+                // output") we g2p around the word and splice the correct
+                // phonemes in.
+                for (i, seg) in split_adjective_live(&t).iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(" lˈa\u{200d}ɪv ");
+                    }
+                    if seg.trim().is_empty() {
+                        continue;
+                    }
+                    let (p, _toks) = g2p.g2p(seg).map_err(|e| anyhow!("g2p: {e}"))?;
+                    out.push_str(p.trim_end());
+                    out.push(' ');
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// One span of the reply on its way to the phonemiser: either text to
+/// phonemise, or a punctuation mark to splice in verbatim.
+#[derive(Debug, PartialEq)]
+enum Piece {
+    Text(String),
+    Mark(char),
+}
+
+/// Punctuation Kokoro renders as real prosody. Every one of these has a token
+/// id in `KOKORO_VOCAB`, and every one is destroyed by misaki-rs — see
+/// `Engine::phonemize`.
+fn is_prosody_mark(c: char) -> bool {
+    matches!(c, ',' | '.' | '!' | '?' | ';' | ':' | '—' | '…')
+}
+
+/// True when a `.` or `:` sits between two digits — a decimal or a clock time
+/// ("3.5", "3:30"), not a sentence end. Splitting there would read "three.
+/// five." as two sentences.
+fn is_numeric_context(chars: &[char], i: usize) -> bool {
+    if !matches!(chars[i], '.' | ':') {
+        return false;
+    }
+    let prev = i.checked_sub(1).and_then(|p| chars.get(p));
+    let next = chars.get(i + 1);
+    matches!((prev, next), (Some(p), Some(n)) if p.is_ascii_digit() && n.is_ascii_digit())
+}
+
+/// Split a reply into text runs and the prosodic marks between them.
+///
+/// Line breaks become a full stop: `speakable::to_speech` turns Markdown
+/// bullets and paragraphs into bare newlines, and misaki drops those too — so
+/// a three-item list was read as one breathless run-on. Consecutive marks
+/// collapse to the first (the author's own punctuation wins over a synthesised
+/// one), so `"Done.\nNext"` yields a single `.`, not two.
+fn segment_prosody(text: &str) -> Vec<Piece> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out: Vec<Piece> = Vec::new();
+    let mut buf = String::new();
+
+    fn flush(out: &mut Vec<Piece>, buf: &mut String) {
+        let t = buf.trim();
+        if !t.is_empty() {
+            out.push(Piece::Text(t.to_string()));
+        }
+        buf.clear();
+    }
+    fn mark(out: &mut Vec<Piece>, c: char) {
+        // Never two marks in a row, and never lead with one.
+        if matches!(out.last(), Some(Piece::Mark(_))) || out.is_empty() {
+            return;
+        }
+        out.push(Piece::Mark(c));
+    }
+
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\n' {
+            flush(&mut out, &mut buf);
+            mark(&mut out, '.');
+            // Swallow the whole run of blank space so one paragraph break
+            // doesn't emit several marks.
+            while i < chars.len() && chars[i].is_whitespace() {
+                i += 1;
+            }
+            continue;
+        }
+        if is_prosody_mark(c) && !is_numeric_context(&chars, i) {
+            flush(&mut out, &mut buf);
+            mark(&mut out, c);
+            i += 1;
+            continue;
+        }
+        buf.push(c);
+        i += 1;
+    }
+    flush(&mut out, &mut buf);
+    out
 }
 
 /// `None` = engine unavailable (models missing / init failed) → caller uses `say`.
@@ -456,6 +601,119 @@ mod tests {
 
     fn words(list: &[&str]) -> HashSet<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    // ── prosody: punctuation must survive into the phoneme stream ──────────
+
+    #[test]
+    fn segments_at_every_prosodic_mark() {
+        use Piece::*;
+        assert_eq!(
+            segment_prosody("Hello, world. Right?"),
+            vec![
+                Text("Hello".into()), Mark(','),
+                Text("world".into()), Mark('.'),
+                Text("Right".into()), Mark('?'),
+            ]
+        );
+    }
+
+    #[test]
+    fn newlines_become_sentence_breaks() {
+        use Piece::*;
+        // speakable::to_speech turns bullets into bare newlines; misaki drops
+        // them, so a list used to be read as one breathless run-on.
+        assert_eq!(
+            segment_prosody("one\ntwo\nthree"),
+            vec![Text("one".into()), Mark('.'), Text("two".into()), Mark('.'), Text("three".into())]
+        );
+        // A paragraph break emits ONE mark, not one per newline.
+        assert_eq!(
+            segment_prosody("first\n\n\nsecond"),
+            vec![Text("first".into()), Mark('.'), Text("second".into())]
+        );
+        // The author's own punctuation wins over a synthesised one.
+        assert_eq!(
+            segment_prosody("Done!\nNext"),
+            vec![Text("Done".into()), Mark('!'), Text("Next".into())]
+        );
+    }
+
+    #[test]
+    fn decimals_and_clock_times_are_not_sentence_ends() {
+        use Piece::*;
+        // "3.5" must not read as "three. five." — nor "3:30" as two clauses.
+        assert_eq!(segment_prosody("version 3.5"), vec![Text("version 3.5".into())]);
+        assert_eq!(segment_prosody("at 3:30 sharp"), vec![Text("at 3:30 sharp".into())]);
+        // …but a real sentence end after a digit still counts.
+        assert_eq!(
+            segment_prosody("It is 5. Yes"),
+            vec![Text("It is 5".into()), Mark('.'), Text("Yes".into())]
+        );
+    }
+
+    #[test]
+    fn never_leads_with_or_doubles_a_mark() {
+        use Piece::*;
+        assert_eq!(segment_prosody("...well"), vec![Text("well".into())]);
+        assert_eq!(segment_prosody("Really?!"), vec![Text("Really".into()), Mark('?')]);
+        assert_eq!(segment_prosody("   "), vec![]);
+    }
+
+    /// The regression that started this: every mark used to be deleted by
+    /// misaki-rs before Kokoro saw it, leaving the model with no phrase
+    /// structure. Assert the marks now reach the token stream, in order.
+    #[test]
+    fn punctuation_reaches_the_kokoro_token_stream() {
+        let g2p = misaki_rs::G2P::new(misaki_rs::Language::EnglishUS);
+        let vocab: HashMap<char, i64> = KOKORO_VOCAB.iter().copied().collect();
+
+        let phonemes = phonemize_with(&g2p, "Hello, world. Is it? Yes — quite.").expect("phonemize");
+        let marks: String = phonemes.chars().filter(|c| is_prosody_mark(*c)).collect();
+        assert_eq!(marks, ",.?—.", "marks lost on the way to Kokoro: {phonemes:?}");
+
+        // Every mark must be a REAL token, not silently dropped by the vocab
+        // filter in `synthesize` — that filter is what hid this bug.
+        for c in marks.chars() {
+            assert!(vocab.contains_key(&c), "{c:?} has no Kokoro token id");
+        }
+
+        // Marks hug the preceding word ("wˈɜːld." not "wˈɜːld ."), which is the
+        // formatting the reference implementation feeds the model.
+        assert!(!phonemes.contains(" ,") && !phonemes.contains(" ."), "{phonemes:?}");
+    }
+
+    #[test]
+    fn bulleted_list_gets_a_pause_per_item() {
+        let g2p = misaki_rs::G2P::new(misaki_rs::Language::EnglishUS);
+        let phonemes = phonemize_with(&g2p, "one\ntwo\nthree").expect("phonemize");
+        // two separators + the utterance-final full stop
+        assert_eq!(
+            phonemes.chars().filter(|c| *c == '.').count(),
+            3,
+            "list items must be separated by real pauses: {phonemes:?}"
+        );
+    }
+
+    #[test]
+    fn unterminated_reply_gets_final_intonation() {
+        let g2p = misaki_rs::G2P::new(misaki_rs::Language::EnglishUS);
+        let p = phonemize_with(&g2p, "Right away sir").expect("phonemize");
+        assert!(p.trim_end().ends_with('.'), "no utterance-final mark: {p:?}");
+        // An existing terminal mark is not doubled.
+        let q = phonemize_with(&g2p, "Is it done?").expect("phonemize");
+        let marks: String = q.chars().filter(|c| is_prosody_mark(*c)).collect();
+        assert_eq!(marks, "?");
+    }
+
+    #[test]
+    fn adjective_live_splice_still_works_through_the_new_path() {
+        let g2p = misaki_rs::G2P::new(misaki_rs::Language::EnglishUS);
+        let p = phonemize_with(&g2p, "The demo is live, sir.").expect("phonemize");
+        assert!(p.contains("lˈa\u{200d}ɪv"), "adjective 'live' lost its splice: {p:?}");
+        // and the comma + full stop survived alongside it
+        let marks: String = p.chars().filter(|c| is_prosody_mark(*c)).collect();
+        assert_eq!(marks, ",.");
     }
 
     #[test]

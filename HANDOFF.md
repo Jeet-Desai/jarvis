@@ -1,5 +1,45 @@
 # HANDOFF — next session starts here
 
+## 🗣️ TTS prosody fix — punctuation now reaches Kokoro (2026-08-15)
+
+User report: *"the pauses aren't natural — no pause when required, long pause when
+not; it feels like cheap text-to-speech."* Root cause was **not** chunking or speed
+tuning. `misaki-rs/src/g2p.rs:262` replaces **every** punctuation mark with a plain
+space (hardcoded, no feature flag), so `"Hello, world. Right?"` reached Kokoro as
+`"həlˈoʊ  wˈɜːld  ɹˈaɪt "` — the model received **zero** punctuation tokens, ever,
+despite `KOKORO_VOCAB` having ids for all of them (`,`=3 `.`=4 `!`=5 `?`=6 `;`=1
+`:`=2 `—`=9 `…`=10). Punctuation is what drives sentence-final falling intonation,
+question rise and clause grouping, so the model had no phrase structure at all: it
+never paused where a sentence ended, and the only audible pauses were the ones it
+invented from runs of spaces plus the `afplay` chunk-seam gap — which lands at
+*character-count* positions. That is exactly "pause where it shouldn't, none where
+it should".
+
+**Fix (`src-tauri/src/kokoro.rs`)** — splice the marks back into the *phoneme*
+string, the same technique `split_adjective_live` already used for `/laɪv/` (a mark
+can't ride inside the g2p input; that's precisely what gets deleted):
+- `segment_prosody()` splits the text into `Piece::Text` / `Piece::Mark`.
+- `phonemize_with()` g2p's each text run separately and re-inserts the literal
+  mark, hugging the preceding word (`wˈɜːld.`, not `wˈɜːld .`).
+- Bare `\n` → `.` — `speakable.rs` turns bullets/paragraphs into newlines, which
+  misaki also drops, so lists were read as one breathless run-on.
+- Consecutive marks collapse to the first; `.`/`:` between digits are not sentence
+  ends ("3.5", "3:30"); an unterminated reply gets a final `.` so it doesn't stop dead.
+- 9 new tests; suite is **48/48**.
+
+☑️ **Needs your ears** — say something that produces (a) a multi-sentence reply,
+(b) a question, (c) a list. Sentence pauses, question rise and per-item breaks
+should all be there now. If the overall rate feels off, `JARVIS_TTS_SPEED` in `.env`
+(default 1.15) is a no-rebuild knob — note it scales pauses as well as phonemes, so
+try 1.0–1.1 if pauses now feel clipped.
+
+*Deliberately NOT changed (measure first):* `trim_silence`, the chunk sizes, and the
+per-chunk `afplay` spawn. With real sentence pauses restored, the ~150ms seam gap now
+lands at a sentence boundary where a pause belongs. Gapless in-process playback
+(rodio/cpal) remains the structural upgrade if seams still bother you.
+
+---
+
 > **As of 2026-07-02 — NEXT TASK: agent → terminal handoff.**
 > **Read [`docs/agent-terminal-handoff-plan.md`](docs/agent-terminal-handoff-plan.md)** — a
 > researched, staged plan (user-requested, high priority): a HUD button + voice command that
